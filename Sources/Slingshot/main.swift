@@ -205,6 +205,7 @@ func classify(_ obs: VNHumanHandPoseObservation) -> (pose: HandPose, debug: Stri
 
 final class GestureEngine {
     var onGrab: () -> Void = {}
+    var onRelease: () -> Void = {}   // fist seen, then hand opens: the "drop" gesture
     var debugLogging = true
 
     private var openFrames = 0
@@ -213,6 +214,11 @@ final class GestureEngine {
     private var cooldownUntil = Date.distantPast
     private var announcedReady = true
     private var lastPose: HandPose = .unknown
+
+    private var seqFist = 0
+    private var seqOpen = 0
+    private var releasePrimedAt: Date?
+    private var releaseCooldownUntil = Date.distantPast
 
     // Effective frame rate is ~15 fps (every 2nd camera frame).
     private let framesToArm = 6      // ~0.4 s of steady open palm
@@ -226,6 +232,28 @@ final class GestureEngine {
             log("   · pose → \(pose) (\(debug))")
         }
         lastPose = pose
+
+        // Fist→open "release" tracking, independent of the grab state machine
+        // (and of its cooldown — a release right after a grab must still register on the catching Mac).
+        switch pose {
+        case .fist:
+            seqFist += 1
+            seqOpen = 0
+            if seqFist >= 2 { releasePrimedAt = now }
+        case .open:
+            seqOpen += 1
+            if seqOpen >= 2 {
+                if let primed = releasePrimedAt,
+                   now.timeIntervalSince(primed) < 2.5, now >= releaseCooldownUntil {
+                    releasePrimedAt = nil
+                    releaseCooldownUntil = now.addingTimeInterval(2.0)
+                    onRelease()
+                }
+                seqFist = 0
+            }
+        case .unknown:
+            break
+        }
 
         guard now >= cooldownUntil else { return }
         if !announcedReady {
@@ -351,30 +379,72 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
         }
     }
 
-    func send(_ url: URL) {
+    // MARK: Hold / catch protocol
+
+    private var heldFile: URL?
+    private var holdGeneration = 0
+    private var remoteHolder: MCPeerID?
+    private let holdWindow: TimeInterval = 30
+
+    /// Grab: keep the screenshot "in the fist". Nothing is sent until a peer catches it.
+    func hold(_ url: URL) {
         let peers = session.connectedPeers
         guard !peers.isEmpty else {
             log("📦 No peer connected — screenshot kept locally at \(url.path)")
             DispatchQueue.main.async { showToast("📦 No Mac connected — saved to Pictures/Slingshot") }
             return
         }
+        heldFile = url
+        holdGeneration += 1
+        let gen = holdGeneration
+        sendControl(["t": "hold"])
+        log("✊ Holding \(url.lastPathComponent) — open your fist at the receiving Mac within \(Int(holdWindow)) s")
+        DispatchQueue.main.async {
+            showToast("✊ Holding screenshot — open your fist at the other Mac to drop it")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + holdWindow) { [weak self] in
+            guard let self, self.holdGeneration == gen, self.heldFile != nil else { return }
+            self.heldFile = nil
+            self.sendControl(["t": "unhold"])
+            log("⌛️ Hold expired — screenshot kept locally")
+            showToast("⌛️ Hold expired — screenshot kept locally")
+        }
+    }
+
+    /// Fist→open seen by this Mac's camera: catch whatever a peer is holding.
+    func catchGesture() {
+        guard let holder = remoteHolder else { return }
+        remoteHolder = nil
+        log("🫳 Catch! Requesting the screenshot from \(holder.displayName)")
+        DispatchQueue.main.async {
+            play("Tink")
+            showToast("🫳 Catching…")
+        }
+        sendControl(["t": "catch"], to: [holder])
+    }
+
+    private func sendControl(_ dict: [String: String], to peers: [MCPeerID]? = nil) {
+        let targets = peers ?? session.connectedPeers
+        guard !targets.isEmpty, let data = try? JSONSerialization.data(withJSONObject: dict) else { return }
+        try? session.send(data, toPeers: targets, with: .reliable)
+    }
+
+    private func deliver(_ url: URL, to peer: MCPeerID) {
         let sender = (Host.current().localizedName ?? "Mac")
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { !$0.isEmpty }
             .joined(separator: "-")
         let name = "from-\(sender)-\(url.lastPathComponent)"
-        for peer in peers {
-            log("🚀 Beaming \(name) to \(peer.displayName)…")
-            session.sendResource(at: url, withName: name, toPeer: peer) { error in
-                if let error {
-                    log("❌ Send to \(peer.displayName) failed: \(error.localizedDescription)")
-                    DispatchQueue.main.async { showToast("❌ Send failed: \(error.localizedDescription)") }
-                } else {
-                    log("✅ Delivered to \(peer.displayName)")
-                    DispatchQueue.main.async {
-                        showToast("✅ Sent to \(cleanName(peer.displayName))")
-                        play("Purr")
-                    }
+        log("🚀 Beaming \(name) to \(peer.displayName)…")
+        session.sendResource(at: url, withName: name, toPeer: peer) { error in
+            if let error {
+                log("❌ Send to \(peer.displayName) failed: \(error.localizedDescription)")
+                DispatchQueue.main.async { showToast("❌ Send failed: \(error.localizedDescription)") }
+            } else {
+                log("✅ Delivered to \(peer.displayName)")
+                DispatchQueue.main.async {
+                    showToast("✅ Dropped on \(cleanName(peer.displayName))")
+                    play("Purr")
                 }
             }
         }
@@ -424,7 +494,32 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
         }
     }
 
-    func session(_ session: MCSession, didReceive data: Data, fromPeer id: MCPeerID) {}
+    func session(_ session: MCSession, didReceive data: Data, fromPeer id: MCPeerID) {
+        guard let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+              let type = dict["t"] else { return }
+        switch type {
+        case "hold":
+            remoteHolder = id
+            log("🫴 \(id.displayName) is holding a screenshot — fist, then open your hand at this Mac to catch it")
+            DispatchQueue.main.async {
+                play("Tink")
+                showToast("🫴 \(cleanName(id.displayName)) is holding a screenshot — fist, then open, to catch it here")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + holdWindow + 2) { [weak self] in
+                if self?.remoteHolder == id { self?.remoteHolder = nil }
+            }
+        case "unhold":
+            if remoteHolder == id { remoteHolder = nil }
+        case "catch":
+            guard let url = heldFile else { return }
+            heldFile = nil
+            holdGeneration += 1
+            log("🎯 \(id.displayName) caught it — sending")
+            deliver(url, to: id)
+        default:
+            break
+        }
+    }
     func session(_ session: MCSession, didReceive stream: InputStream, withName name: String, fromPeer id: MCPeerID) {}
 
     func session(_ session: MCSession, didStartReceivingResourceWithName name: String,
@@ -484,7 +579,7 @@ final class StatusUI: NSObject {
         item.button?.title = peers.isEmpty ? "✊…" : "✊✓"
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "Slingshot v0.3", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Slingshot v0.4", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
         if peers.isEmpty {
             menu.addItem(withTitle: "Searching for nearby Macs…", action: nil, keyEquivalent: "")
@@ -557,7 +652,7 @@ final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
 // MARK: - Main
 
-log("Slingshot v0.3 — palm, then fist, and your screen flies to the nearest Mac")
+log("Slingshot v0.4 — palm, then fist, and your screen flies to the nearest Mac")
 
 // A real NSApplication event loop so Finder/LaunchServices see the app check in.
 // Without this, a double-clicked launch gets flagged "not responding".
@@ -583,6 +678,10 @@ func startEverything() {
 
     link.start()
 
+    engine.onRelease = {
+        link.catchGesture()
+    }
+
     engine.onGrab = {
         play("Pop")
         log("✊ GRAB! Taking screenshot…")
@@ -594,7 +693,7 @@ func startEverything() {
                     animateGrab(image: img)
                 }
             }
-            link.send(shot)
+            link.hold(shot)
         } else {
             log("❌ Screenshot failed — check Screen Recording permission")
             DispatchQueue.main.async { showToast("❌ Screenshot failed — check Screen Recording permission") }

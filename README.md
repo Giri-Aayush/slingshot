@@ -2,7 +2,7 @@
 
 **Grab your Mac's screen with a fist. Watch it land on your friend's Mac.**
 
-Inspired by Huawei's Mate 70 air-gesture file transfer demo — rebuilt for the Apple ecosystem in a single evening. Show your open palm to the camera, close your fist, and a screenshot of your desktop flies to every nearby Mac running the app: camera flash, shrink-away animation on your screen, zoom-in arrival with a chime on theirs.
+Inspired by Huawei's Mate 70 air-gesture file transfer demo — rebuilt for the Apple ecosystem. Show your open palm to the camera and close your fist: camera flash, and a screenshot of your desktop is now *held in your hand* — nothing is sent yet. Walk to the Mac you want it on and open your fist at its camera: it catches the drop, the file transfers to that Mac only, and zooms up on its screen with a chime. Don't drop it anywhere within 30 seconds and it quietly stays in your Pictures folder.
 
 https://github.com/Giri-Aayush/slingshot
 
@@ -10,7 +10,7 @@ https://github.com/Giri-Aayush/slingshot
 
 - **Gesture detection** — Apple's Vision framework (`VNDetectHumanHandPoseRequest`) tracks 21 hand joints from the FaceTime camera at ~15 fps. A small state machine arms on ~0.4 s of open palm (Tink sound), then fires on ~0.13 s of closed fist (Pop sound). Fingertips that Vision loses sight of count as curled — that's what makes fist detection robust when fingers occlude themselves.
 - **Screenshot** — `/usr/sbin/screencapture` grabs the full desktop to `~/Pictures/Slingshot/`.
-- **Transfer** — MultipeerConnectivity (the same local Wi-Fi / peer-to-peer transport AirDrop uses). Peers auto-discover on the local network, auto-connect (with 8 s retries), and stream the PNG. Received files land in `~/Downloads` as `from-<sender>-grab-<timestamp>.png` and open automatically.
+- **Hold & catch** — a grab doesn't broadcast anything. The grabbing Mac keeps the file and tells peers "I'm holding". When another Mac's camera sees the release gesture (fist, then open hand) within 30 s, it claims the drop and only then does the file stream to it — via MultipeerConnectivity (the same local Wi-Fi / peer-to-peer transport AirDrop uses; auto-discover, auto-connect, 8 s retries). Received files land in `~/Downloads` as `from-<sender>-grab-<timestamp>.png` and open automatically.
 - **Feedback** — menu bar icon (✊… searching / ✊✓ connected), toast banners for connect/send/receive/errors, flash + fly-away animation on grab, zoom-up animation on receive.
 
 There is no sender or receiver role — every copy of the app does both. Real AirDrop has no programmatic-send API, which is why the transfer layer is MultipeerConnectivity.
@@ -25,7 +25,7 @@ There is no sender or receiver role — every copy of the app does both. Real Ai
 4. Grant **Screen Recording** (System Settings → Privacy & Security → Screen & System Audio Recording → enable Slingshot), then quit and reopen the app — that permission only applies at launch.
 5. Look for the **✊ icon in the menu bar**. When a second Mac on the same Wi-Fi runs the app, it flips to ✊✓ within seconds.
 
-Then: palm at the camera, hold half a second, make a fist. 👋 → ✊ → 🚀
+Then: palm at your camera, make a fist to grab. Walk over, open your fist at the other Mac to drop. 👋 → ✊ → 🚶 → 🫳 → 🎁
 
 ## Build from source
 
@@ -56,7 +56,6 @@ Everything the app does is narrated in `~/Library/Logs/Slingshot.log` (also reac
 ## Roadmap
 
 - Grab the frontmost Finder selection / any file, not just screenshots
-- Receiver-side "open palm to catch" gesture (two-sided handshake like the original Huawei demo)
 - Proper notarized distribution
 - iPad support (same Vision + MultipeerConnectivity APIs)
 
