@@ -6,9 +6,9 @@ import Vision
 // MARK: - Helpers
 
 let logFileURL = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent("Library/Logs/AirGrab.log")
+    .appendingPathComponent("Library/Logs/Slingshot.log")
 let shotsDir = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent("Pictures/AirGrab", isDirectory: true)
+    .appendingPathComponent("Pictures/Slingshot", isDirectory: true)
 
 func log(_ msg: String) {
     let df = DateFormatter()
@@ -308,7 +308,7 @@ func takeScreenshot() -> URL? {
 // MARK: - Peer-to-peer link
 
 final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceBrowserDelegate {
-    static let serviceType = "airgrab"
+    static let serviceType = "slingshot"
 
     let peerID: MCPeerID
     let session: MCSession
@@ -355,7 +355,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
         let peers = session.connectedPeers
         guard !peers.isEmpty else {
             log("📦 No peer connected — screenshot kept locally at \(url.path)")
-            DispatchQueue.main.async { showToast("📦 No Mac connected — saved to Pictures/AirGrab") }
+            DispatchQueue.main.async { showToast("📦 No Mac connected — saved to Pictures/Slingshot") }
             return
         }
         let sender = (Host.current().localizedName ?? "Mac")
@@ -484,7 +484,7 @@ final class StatusUI: NSObject {
         item.button?.title = peers.isEmpty ? "✊…" : "✊✓"
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "AirGrab v0.2", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Slingshot v0.3", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
         if peers.isEmpty {
             menu.addItem(withTitle: "Searching for nearby Macs…", action: nil, keyEquivalent: "")
@@ -501,7 +501,7 @@ final class StatusUI: NSObject {
         logItem.target = self
         menu.addItem(logItem)
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit AirGrab", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(withTitle: "Quit Slingshot", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
     }
 
@@ -519,7 +519,7 @@ final class StatusUI: NSObject {
 
 final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let session = AVCaptureSession()
-    private let queue = DispatchQueue(label: "airgrab.camera")
+    private let queue = DispatchQueue(label: "slingshot.camera")
     private let onFrame: (CVPixelBuffer) -> Void
     private var frameCount = 0
 
@@ -557,7 +557,7 @@ final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
 // MARK: - Main
 
-log("AirGrab v0.2 — palm, then fist, and your screen flies to the nearest Mac")
+log("Slingshot v0.3 — palm, then fist, and your screen flies to the nearest Mac")
 
 // A real NSApplication event loop so Finder/LaunchServices see the app check in.
 // Without this, a double-clicked launch gets flagged "not responding".
@@ -576,8 +576,8 @@ func startEverything() {
 
     // Screen-recording permission: without it screencapture returns nothing useful.
     if !CGPreflightScreenCaptureAccess() {
-        log("⚠️ Screen Recording permission missing — requesting now. Grant it in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen AirGrab.")
-        showToast("⚠️ Grant Screen Recording in System Settings, then reopen AirGrab")
+        log("⚠️ Screen Recording permission missing — requesting now. Grant it in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen Slingshot.")
+        showToast("⚠️ Grant Screen Recording in System Settings, then reopen Slingshot")
         CGRequestScreenCaptureAccess()
     }
 
@@ -634,13 +634,13 @@ case .notDetermined:
             if ok {
                 startEverything()
             } else {
-                log("❌ Camera access denied. Enable AirGrab in System Settings → Privacy & Security → Camera, then reopen.")
+                log("❌ Camera access denied. Enable Slingshot in System Settings → Privacy & Security → Camera, then reopen.")
                 app.terminate(nil)
             }
         }
     }
 default:
-    log("❌ Camera access denied. Enable AirGrab in System Settings → Privacy & Security → Camera, then reopen.")
+    log("❌ Camera access denied. Enable Slingshot in System Settings → Privacy & Security → Camera, then reopen.")
     DispatchQueue.main.asyncAfter(deadline: .now() + 1) { app.terminate(nil) }
 }
 

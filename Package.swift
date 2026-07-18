@@ -2,9 +2,9 @@
 import PackageDescription
 
 let package = Package(
-    name: "AirGrab",
+    name: "Slingshot",
     platforms: [.macOS(.v13)],
     targets: [
-        .executableTarget(name: "AirGrab", path: "Sources/AirGrab")
+        .executableTarget(name: "Slingshot", path: "Sources/Slingshot")
     ]
 )
