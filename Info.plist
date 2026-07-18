@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>AirGrab</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.aayush.airgrab</string>
+	<key>CFBundleName</key>
+	<string>AirGrab</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.2</string>
+	<key>CFBundleVersion</key>
+	<string>2</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_airgrab._tcp</string>
+		<string>_airgrab._udp</string>
+	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>AirGrab watches for your palm-to-fist gesture to grab a screenshot.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>AirGrab finds nearby Macs running AirGrab to beam your screenshot to.</string>
+</dict>
+</plist>

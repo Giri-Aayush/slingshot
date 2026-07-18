@@ -1,0 +1,6 @@
+.build/
+.swiftpm/
+AirGrab.app/
+AirGrab.zip
+*.png
+.DS_Store
