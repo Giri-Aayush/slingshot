@@ -10,19 +10,30 @@ let logFileURL = FileManager.default.homeDirectoryForCurrentUser
 let shotsDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Pictures/Slingshot", isDirectory: true)
 
-func log(_ msg: String) {
+let logQueue = DispatchQueue(label: "slingshot.log")
+let logFormatter: DateFormatter = {
     let df = DateFormatter()
     df.dateFormat = "HH:mm:ss"
-    let line = "[\(df.string(from: Date()))] \(msg)\n"
-    print(line, terminator: "")
-    fflush(stdout)
-    if let data = line.data(using: .utf8) {
-        if let handle = try? FileHandle(forWritingTo: logFileURL) {
-            handle.seekToEndOfFile()
-            handle.write(data)
-            try? handle.close()
-        } else {
-            try? data.write(to: logFileURL)
+    return df
+}()
+let logHandle: FileHandle? = {
+    let fm = FileManager.default
+    if !fm.fileExists(atPath: logFileURL.path) {
+        fm.createFile(atPath: logFileURL.path, contents: nil)
+    }
+    let handle = try? FileHandle(forWritingTo: logFileURL)
+    handle?.seekToEndOfFile()
+    return handle
+}()
+
+func log(_ msg: String) {
+    let now = Date()
+    logQueue.async {
+        let line = "[\(logFormatter.string(from: now))] \(msg)\n"
+        print(line, terminator: "")
+        fflush(stdout)
+        if let data = line.data(using: .utf8) {
+            logHandle?.write(data)
         }
     }
 }
@@ -197,7 +208,7 @@ func classify(_ obs: VNHumanHandPoseObservation) -> (pose: HandPose, wrist: CGPo
     }
     let debug = "ext=\(extended) curl=\(curled) reach=[\(reaches.joined(separator: " "))]"
     if extended == 4 { return (.open, wrist, debug) }
-    if extended == 0 && curled >= 3 { return (.fist, wrist, debug) }
+    if extended == 0 && curled >= 2 { return (.fist, wrist, debug) }
     return (.unknown, wrist, debug)
 }
 
@@ -207,7 +218,9 @@ final class GestureEngine {
     var onGrab: () -> Void = {}
     var onRelease: () -> Void = {}       // sustained fist, then open hand: the "drop" gesture
     var onReleasePrimed: () -> Void = {} // the fist half of a drop is complete
+    var onGrabSuppressed: () -> Void = {} // user shows a palm while grabbing is paused
     var grabAllowed: () -> Bool = { true }
+    var releaseAllowed: () -> Bool = { true }
     var debugLogging = true
 
     // ~15 processed frames per second. A few off-frames (grace) are tolerated
@@ -246,6 +259,9 @@ final class GestureEngine {
     private var relOpen: Streak
     private var relPrimedAt: Date?
     private var relCooldownUntil = Date.distantPast
+
+    private var suppressedOpen = 0
+    private var suppressNoticeAfter = Date.distantPast
 
     init() {
         openStreak = Streak(grace: grace)
@@ -306,7 +322,15 @@ final class GestureEngine {
                 fistStreak.neutral()
             }
         } else {
-            if pose == .open && steady && grabAllowed() {
+            if pose == .open && !grabAllowed() {
+                openStreak.reset()
+                suppressedOpen += 1
+                if suppressedOpen >= 15, now >= suppressNoticeAfter {
+                    suppressNoticeAfter = now.addingTimeInterval(10)
+                    onGrabSuppressed()
+                }
+            } else if pose == .open && steady {
+                suppressedOpen = 0
                 openStreak.hit()
                 if openStreak.count >= armNeeded {
                     armed = true
@@ -318,12 +342,21 @@ final class GestureEngine {
             } else if pose == .open {
                 openStreak.reset()  // moving palm: start over
             } else {
+                suppressedOpen = 0
                 openStreak.neutral()
             }
         }
     }
 
     private func updateRelease(pose: HandPose, steady: Bool, now: Date) {
+        // The release detector only runs while a peer's hold is pending. This keeps
+        // a grab's own fist from priming a release, so grab and catch never overlap.
+        guard releaseAllowed() else {
+            relFist.reset()
+            relOpen.reset()
+            relPrimedAt = nil
+            return
+        }
         if let primed = relPrimedAt {
             if now.timeIntervalSince(primed) > releaseWindow {
                 relPrimedAt = nil
@@ -409,11 +442,33 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
     let session: MCSession
     private let advertiser: MCNearbyServiceAdvertiser
     private let browser: MCNearbyServiceBrowser
-    private var discovered: Set<MCPeerID> = []
     private var retryTimer: Timer?
 
+    private let holdWindow: TimeInterval = 30
+    private let postCatchMute: TimeInterval = 5
+
+    // All mutable state below is guarded by `lock`. It is touched from three
+    // contexts: MultipeerConnectivity's private delegate queue, the camera queue
+    // (via the gesture engine's callbacks), and main-queue expiry closures.
+    // Never call out (send, UI, log) while holding the lock.
+    private let lock = NSLock()
+    private var discovered: Set<MCPeerID> = []
+    private var heldFile: URL?
+    private var holdGeneration = 0
+    private var lastHoldEnd = "caught"
+    private var remoteHolders: [MCPeerID: Date] = [:]
+    private var grabMutedUntil = Date.distantPast
+
+    var isHolding: Bool { lock.withLock { heldFile != nil } }
+    var grabMuted: Bool { lock.withLock { Date() < grabMutedUntil } }
+    var hasRemoteHold: Bool {
+        let now = Date()
+        return lock.withLock { remoteHolders.values.contains { now < $0 } }
+    }
     var nearbyPeers: [MCPeerID] {
-        discovered.filter { !session.connectedPeers.contains($0) }.sorted { $0.displayName < $1.displayName }
+        let connected = session.connectedPeers
+        return lock.withLock { discovered.filter { !connected.contains($0) } }
+            .sorted { $0.displayName < $1.displayName }
     }
 
     override init() {
@@ -444,7 +499,11 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
     }
 
     private func retryInvites() {
-        for id in discovered where !session.connectedPeers.contains(id) && shouldInvite(id) {
+        let connected = session.connectedPeers
+        let candidates = lock.withLock {
+            discovered.filter { !connected.contains($0) && shouldInvite($0) }
+        }
+        for id in candidates {
             log("🔁 Retrying connection to \(id.displayName)…")
             browser.invitePeer(id, to: session, withContext: nil, timeout: 15)
         }
@@ -452,18 +511,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
 
     // MARK: Hold / catch protocol
 
-    private var heldFile: URL?
-    private var holdGeneration = 0
-    private var remoteHolder: MCPeerID?
-    private let holdWindow: TimeInterval = 30
-
-    /// While true, this Mac should not start a grab: it is holding, mid-catch,
-    /// or just finished a catch (the hand that caught would re-trigger instantly).
-    var grabMutedUntil = Date.distantPast
-    var isHolding: Bool { heldFile != nil }
-    var hasRemoteHold: Bool { remoteHolder != nil }
-
-    /// Grab: keep the screenshot "in the fist". Nothing is sent until a peer catches it.
+    /// Grab: keep the screenshot in the fist. Nothing is sent until a peer catches it.
     func hold(_ url: URL) {
         let peers = session.connectedPeers
         guard !peers.isEmpty else {
@@ -471,40 +519,66 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             DispatchQueue.main.async { showToast("📦 No Mac connected. Saved to Pictures/Slingshot") }
             return
         }
-        heldFile = url
-        holdGeneration += 1
-        let gen = holdGeneration
+        let gen: Int = lock.withLock {
+            heldFile = url
+            holdGeneration += 1
+            return holdGeneration
+        }
         sendControl(["t": "hold"])
         log("✊ Holding \(url.lastPathComponent). At the receiving Mac: fist for 1 second, then open your hand. Expires in \(Int(holdWindow)) s")
         DispatchQueue.main.async {
             showToast("✊ Holding screenshot. At the other Mac: fist for 1 second, then open your hand")
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + holdWindow) { [weak self] in
-            guard let self, self.holdGeneration == gen, self.heldFile != nil else { return }
-            self.heldFile = nil
+            guard let self else { return }
+            let expired: Bool = self.lock.withLock {
+                guard self.holdGeneration == gen, self.heldFile != nil else { return false }
+                self.heldFile = nil
+                self.lastHoldEnd = "expired"
+                return true
+            }
+            guard expired else { return }
             self.sendControl(["t": "unhold"])
             log("⌛️ Hold expired. Screenshot saved locally")
             showToast("⌛️ Hold expired. Screenshot saved locally")
         }
     }
 
-    /// Fist→open seen by this Mac's camera: catch whatever a peer is holding.
+    /// A deliberate fist-then-open at this Mac's camera: catch the freshest live hold.
     func catchGesture() {
-        guard let holder = remoteHolder else { return }
-        remoteHolder = nil
-        grabMutedUntil = Date().addingTimeInterval(5)
+        let connected = session.connectedPeers
+        let holder: MCPeerID? = lock.withLock {
+            let now = Date()
+            remoteHolders = remoteHolders.filter { now < $0.value && connected.contains($0.key) }
+            guard let best = remoteHolders.max(by: { $0.value < $1.value })?.key else { return nil }
+            remoteHolders[best] = nil
+            grabMutedUntil = Date().addingTimeInterval(postCatchMute)
+            return best
+        }
+        guard let holder else { return }
         log("🫳 Catch! Requesting the screenshot from \(holder.displayName)")
         DispatchQueue.main.async {
             play("Tink")
             showToast("🫳 Catching…")
         }
-        sendControl(["t": "catch"], to: [holder])
+        if !sendControl(["t": "catch"], to: [holder]) {
+            lock.withLock { grabMutedUntil = Date.distantPast }
+            log("❌ Catch failed. \(holder.displayName) is unreachable")
+            DispatchQueue.main.async { showToast("❌ Catch failed. The holding Mac is unreachable") }
+        }
     }
 
-    private func sendControl(_ dict: [String: String], to peers: [MCPeerID]? = nil) {
+    @discardableResult
+    private func sendControl(_ dict: [String: String], to peers: [MCPeerID]? = nil) -> Bool {
         let targets = peers ?? session.connectedPeers
-        guard !targets.isEmpty, let data = try? JSONSerialization.data(withJSONObject: dict) else { return }
-        try? session.send(data, toPeers: targets, with: .reliable)
+        guard !targets.isEmpty, let data = try? JSONSerialization.data(withJSONObject: dict) else { return false }
+        do {
+            try session.send(data, toPeers: targets, with: .reliable)
+            return true
+        } catch {
+            log("⚠️ Control message did not send: \(error.localizedDescription)")
+            return false
+        }
     }
 
     private func deliver(_ url: URL, to peer: MCPeerID) {
@@ -532,7 +606,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
 
     func browser(_ browser: MCNearbyServiceBrowser, foundPeer id: MCPeerID, withDiscoveryInfo info: [String: String]?) {
         log("🔍 Found peer \(id.displayName)")
-        discovered.insert(id)
+        lock.withLock { _ = discovered.insert(id) }
         DispatchQueue.main.async { statusUI?.refresh() }
         if shouldInvite(id) {
             browser.invitePeer(id, to: session, withContext: nil, timeout: 15)
@@ -541,7 +615,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
 
     func browser(_ browser: MCNearbyServiceBrowser, lostPeer id: MCPeerID) {
         log("👋 Lost sight of \(id.displayName)")
-        discovered.remove(id)
+        lock.withLock { _ = discovered.remove(id) }
         DispatchQueue.main.async { statusUI?.refresh() }
     }
 
@@ -568,6 +642,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             }
         case .notConnected:
             log("🔌 Disconnected from \(id.displayName)")
+            lock.withLock { remoteHolders[id] = nil }
             DispatchQueue.main.async { statusUI?.refresh() }
         @unknown default:
             break
@@ -579,34 +654,39 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
               let type = dict["t"] else { return }
         switch type {
         case "hold":
-            remoteHolder = id
+            lock.withLock { remoteHolders[id] = Date().addingTimeInterval(holdWindow + 2) }
             log("🫴 \(id.displayName) is holding a screenshot. Hold a fist for 1 second, then open your hand to catch it here")
             DispatchQueue.main.async {
                 play("Tink")
                 showToast("🫴 \(cleanName(id.displayName)) is holding a screenshot. Fist for 1 second, then open, to catch it here")
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + holdWindow + 2) { [weak self] in
-                if self?.remoteHolder == id { self?.remoteHolder = nil }
-            }
         case "unhold":
-            if remoteHolder == id { remoteHolder = nil }
-        case "late":
-            log("🐢 Too late. Someone else caught it first")
-            DispatchQueue.main.async { showToast("🐢 Too late. Someone else caught it first") }
+            lock.withLock { remoteHolders[id] = nil }
         case "catch":
-            guard let url = heldFile else {
-                sendControl(["t": "late"], to: [id])
-                return
+            let url: URL? = lock.withLock {
+                guard let u = heldFile else { return nil }
+                heldFile = nil
+                holdGeneration += 1
+                lastHoldEnd = "caught"
+                return u
             }
-            heldFile = nil
-            holdGeneration += 1
-            sendControl(["t": "unhold"])  // tell everyone else the hold is gone
-            log("🎯 \(id.displayName) caught it. Sending")
-            deliver(url, to: id)
+            if let url {
+                sendControl(["t": "unhold"])  // the hold is spoken for; stand everyone down
+                log("🎯 \(id.displayName) caught it. Sending")
+                deliver(url, to: id)
+            } else {
+                let why = lock.withLock { lastHoldEnd }
+                sendControl(["t": "late", "why": why], to: [id])
+            }
+        case "late":
+            let why = dict["why"] == "expired" ? "The hold expired" : "Someone else caught it first"
+            log("🐢 Too late. \(why)")
+            DispatchQueue.main.async { showToast("🐢 Too late. \(why)") }
         default:
             break
         }
     }
+
     func session(_ session: MCSession, didReceive stream: InputStream, withName name: String, fromPeer id: MCPeerID) {}
 
     func session(_ session: MCSession, didStartReceivingResourceWithName name: String,
@@ -630,7 +710,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             dest = downloads.appendingPathComponent("\(base)-\(counter).\(ext)")
             counter += 1
         }
-        grabMutedUntil = Date().addingTimeInterval(5)
+        lock.withLock { grabMutedUntil = Date().addingTimeInterval(postCatchMute) }
         do {
             try FileManager.default.copyItem(at: localURL, to: dest)
             log("🎁 Received \(name) from \(id.displayName) → \(dest.path)")
@@ -668,7 +748,7 @@ final class StatusUI: NSObject {
         item.button?.title = connected.isEmpty ? "✊…" : "✊ \(connected.count)"
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "Slingshot v0.7", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Slingshot v0.8", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
         if connected.isEmpty && nearby.isEmpty {
             menu.addItem(withTitle: "Searching for nearby Macs…", action: nil, keyEquivalent: "")
@@ -749,7 +829,7 @@ final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
 // MARK: - Main
 
-log("Slingshot v0.7. Palm, then fist, and your screen flies to the nearest Mac")
+log("Slingshot v0.8. Palm, then fist, and your screen flies to the nearest Mac")
 
 // A real NSApplication event loop so Finder/LaunchServices see the app check in.
 // Without this, a double-clicked launch gets flagged "not responding".
@@ -778,7 +858,16 @@ func startEverything() {
     // A Mac never grabs while it is holding, has a catch pending, or just caught.
     // Otherwise the catcher's own hand re-triggers a grab on the receiving Mac.
     engine.grabAllowed = {
-        !link.isHolding && !link.hasRemoteHold && Date() >= link.grabMutedUntil
+        !link.isHolding && !link.hasRemoteHold && !link.grabMuted
+    }
+
+    engine.releaseAllowed = {
+        link.hasRemoteHold
+    }
+
+    engine.onGrabSuppressed = {
+        log("⏸️ Grab paused while a hold is pending")
+        DispatchQueue.main.async { showToast("⏸️ Grab paused while a hold is pending") }
     }
 
     engine.onRelease = {
@@ -786,27 +875,28 @@ func startEverything() {
     }
 
     engine.onReleasePrimed = {
-        if link.hasRemoteHold {
-            play("Tink")
-            log("👊 Fist seen. Open your hand to drop it here")
-        }
+        play("Tink")
+        log("👊 Fist seen. Open your hand to drop it here")
     }
 
     engine.onGrab = {
         play("Pop")
-        log("✊ GRAB! Taking screenshot…")
-        if let shot = takeScreenshot() {
-            log("🖼  Screenshot saved: \(shot.lastPathComponent)")
-            if let img = NSImage(contentsOf: shot) {
-                DispatchQueue.main.async {
-                    flashScreen()
-                    animateGrab(image: img)
+        // Off the camera queue: screencapture blocks for hundreds of milliseconds.
+        DispatchQueue.global(qos: .userInitiated).async {
+            log("✊ GRAB! Taking screenshot…")
+            if let shot = takeScreenshot() {
+                log("🖼  Screenshot saved: \(shot.lastPathComponent)")
+                if let img = NSImage(contentsOf: shot) {
+                    DispatchQueue.main.async {
+                        flashScreen()
+                        animateGrab(image: img)
+                    }
                 }
+                link.hold(shot)
+            } else {
+                log("❌ Screenshot failed. Check Screen Recording permission")
+                DispatchQueue.main.async { showToast("❌ Screenshot failed. Check Screen Recording permission") }
             }
-            link.hold(shot)
-        } else {
-            log("❌ Screenshot failed. Check Screen Recording permission")
-            DispatchQueue.main.async { showToast("❌ Screenshot failed. Check Screen Recording permission") }
         }
     }
 
