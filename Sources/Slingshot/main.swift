@@ -228,11 +228,15 @@ func animateReceive(image: NSImage, then completion: @escaping () -> Void) {
 
 // MARK: - Notch island
 
-/// A Dynamic Island style banner that grows out of the MacBook notch.
-/// At rest the window is fully transparent: the physical notch plays itself,
-/// and the only thing Slingshot ever draws idle is the ember heartbeat when
-/// peers are connected. Geometry is recomputed on every transition, so display
-/// changes can never strand a black slab on the wrong screen.
+/// A Dynamic Island that grows out of the MacBook notch.
+///
+/// The hosting window is a fixed transparent canvas pinned over the notch; it
+/// never moves or resizes. Everything visual is one CAShapeLayer slab whose
+/// path morphs with a real spring. The silhouette flares outward at the top
+/// (concave fillets melting into the notch) and rounds at the bottom, the
+/// look pioneered by the boring.notch family of apps; the implementation
+/// here is original. At rest the slab is invisible and only the ember
+/// heartbeat draws when peers are connected.
 final class NotchIsland {
     static let shared = NotchIsland()
 
@@ -252,14 +256,9 @@ final class NotchIsland {
         let total: TimeInterval
     }
 
-    private struct Geometry {
-        let screen: NSScreen
-        let hasNotch: Bool
-        let notchRect: NSRect
-    }
-
     private let window: NSWindow
-    private let container = NSView()
+    private let canvas = NSView()
+    private let slab = CAShapeLayer()
     private let content = NSView()
     private let iconWell = NSView()
     private let iconView = NSImageView()
@@ -273,7 +272,18 @@ final class NotchIsland {
     private var persistent: PersistentState?
     private var connectedCount = 0
     private var expanded = false
+
     private let bandHeight: CGFloat = 36
+    private let canvasWidth: CGFloat = 800
+    private let canvasHeight: CGFloat = 110
+    private let topFlare: CGFloat = 8
+    private let bottomRadius: CGFloat = 18
+
+    // Geometry of the current screen's notch, in canvas coordinates.
+    private var notchWidth: CGFloat = 200
+    private var notchHeight: CGFloat = 32
+    private var slabTop: CGFloat = 110
+    private var hasNotch = false
 
     private init() {
         window = NSWindow(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
@@ -285,12 +295,17 @@ final class NotchIsland {
         window.level = .statusBar
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
 
-        container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor.clear.cgColor
-        container.layer?.cornerRadius = 10
-        container.layer?.cornerCurve = .continuous
-        container.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
-        window.contentView = container
+        canvas.wantsLayer = true
+        window.contentView = canvas
+
+        slab.fillColor = NSColor.clear.cgColor
+        slab.strokeColor = NSColor.clear.cgColor
+        slab.lineWidth = 1
+        slab.shadowColor = NSColor.black.cgColor
+        slab.shadowOpacity = 0
+        slab.shadowRadius = 12
+        slab.shadowOffset = CGSize(width: 0, height: -5)
+        canvas.layer?.addSublayer(slab)
 
         // Ember: the resting heartbeat when peers are connected.
         ember.bounds = CGRect(x: 0, y: 0, width: 4, height: 4)
@@ -309,10 +324,10 @@ final class NotchIsland {
         pulse.repeatCount = .infinity
         pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         ember.add(pulse, forKey: "breathe")
-        container.layer?.addSublayer(ember)
+        canvas.layer?.addSublayer(ember)
 
         content.alphaValue = 0
-        container.addSubview(content)
+        canvas.addSubview(content)
 
         iconWell.wantsLayer = true
         iconWell.layer?.cornerRadius = 11
@@ -347,38 +362,100 @@ final class NotchIsland {
         ringTrack.strokeColor = NSColor.white.withAlphaComponent(0.14).cgColor
         content.addSubview(ringView)
 
-        if let g = geometry(), g.hasNotch {
-            window.setFrame(g.notchRect, display: true)
-            window.orderFront(nil)
-        }
-
+        reanchor()
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in
-            guard let self, !self.expanded else { return }
-            if let g = self.geometry(), g.hasNotch {
-                self.window.setFrame(g.notchRect, display: true)
-                self.window.orderFront(nil)
-            } else {
-                self.window.orderOut(nil)
-            }
-            self.updateEmber()
+            self?.reanchor()
         }
     }
 
-    /// Fresh every time: the notch screen can appear, vanish, or move.
-    private func geometry() -> Geometry? {
-        if let s = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) {
-            let sides = (s.auxiliaryTopLeftArea?.width ?? 0) + (s.auxiliaryTopRightArea?.width ?? 0)
-            let w = max(s.frame.width - sides, 120)
-            let h = s.safeAreaInsets.top
-            return Geometry(screen: s, hasNotch: true,
-                            notchRect: NSRect(x: s.frame.midX - w / 2, y: s.frame.maxY - h,
-                                              width: w, height: h))
+    /// Pin the fixed canvas over the current notch (or top-center, notchless).
+    private func reanchor() {
+        let notchScreen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 }
+        guard let screen = notchScreen ?? NSScreen.main else {
+            window.orderOut(nil)
+            return
         }
-        guard let s = NSScreen.main else { return nil }
-        return Geometry(screen: s, hasNotch: false,
-                        notchRect: NSRect(x: s.frame.midX - 120, y: s.frame.maxY - 34,
-                                          width: 240, height: 34))
+        hasNotch = notchScreen != nil
+        if hasNotch {
+            let sides = (screen.auxiliaryTopLeftArea?.width ?? 0) + (screen.auxiliaryTopRightArea?.width ?? 0)
+            notchWidth = max(screen.frame.width - sides, 120)
+            notchHeight = screen.safeAreaInsets.top
+        } else {
+            notchWidth = 240
+            notchHeight = 0
+        }
+        slabTop = canvasHeight - (hasNotch ? 0 : 8)
+
+        let frame = NSRect(x: screen.frame.midX - canvasWidth / 2,
+                           y: screen.frame.maxY - canvasHeight,
+                           width: canvasWidth, height: canvasHeight)
+        window.setFrame(frame, display: true)
+        window.orderFront(nil)
+        slab.frame = canvas.bounds
+        if !expanded {
+            slab.path = collapsedPath()
+        } else if let p = persistent {
+            expand(symbol: p.symbol, tint: p.tint, text: p.text, deadline: p.deadline, total: p.total)
+        }
+        updateEmber()
+    }
+
+    /// The island silhouette: top edge widest, concave flares at the top
+    /// corners, convex rounds at the bottom. Same segment structure at every
+    /// size, so paths interpolate cleanly in a spring.
+    private func slabPath(centerX: CGFloat, width: CGFloat, height: CGFloat) -> CGPath {
+        let minX = centerX - width / 2
+        let maxX = centerX + width / 2
+        let topY = slabTop
+        let bottomY = slabTop - height
+        let tr = min(topFlare, width / 4, height / 2)
+        let br = min(bottomRadius, width / 4 - tr, height / 2)
+
+        let p = CGMutablePath()
+        p.move(to: CGPoint(x: minX, y: topY))
+        p.addQuadCurve(to: CGPoint(x: minX + tr, y: topY - tr),
+                       control: CGPoint(x: minX + tr, y: topY))
+        p.addLine(to: CGPoint(x: minX + tr, y: bottomY + br))
+        p.addQuadCurve(to: CGPoint(x: minX + tr + br, y: bottomY),
+                       control: CGPoint(x: minX + tr, y: bottomY))
+        p.addLine(to: CGPoint(x: maxX - tr - br, y: bottomY))
+        p.addQuadCurve(to: CGPoint(x: maxX - tr, y: bottomY + br),
+                       control: CGPoint(x: maxX - tr, y: bottomY))
+        p.addLine(to: CGPoint(x: maxX - tr, y: topY - tr))
+        p.addQuadCurve(to: CGPoint(x: maxX, y: topY),
+                       control: CGPoint(x: maxX - tr, y: topY))
+        p.closeSubpath()
+        return p
+    }
+
+    private func collapsedPath() -> CGPath {
+        slabPath(centerX: canvasWidth / 2, width: notchWidth, height: max(notchHeight, 0.5))
+    }
+
+    private func morph(to path: CGPath, spring: Bool) {
+        let from = slab.presentation()?.path ?? slab.path
+        let anim: CAAnimation
+        if spring {
+            // The Atoll school of motion: response ~0.38, damping fraction ~0.8.
+            let sa = CASpringAnimation(keyPath: "path")
+            sa.fromValue = from
+            sa.toValue = path
+            sa.mass = 1
+            sa.stiffness = 270
+            sa.damping = 26
+            sa.duration = sa.settlingDuration
+            anim = sa
+        } else {
+            let ba = CABasicAnimation(keyPath: "path")
+            ba.fromValue = from
+            ba.toValue = path
+            ba.duration = 0.25
+            ba.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            anim = ba
+        }
+        slab.path = path
+        slab.add(anim, forKey: "morph")
     }
 
     // MARK: Public API
@@ -425,9 +502,9 @@ final class NotchIsland {
     }
 
     private func updateEmber() {
-        ember.isHidden = expanded || connectedCount == 0 || !(geometry()?.hasNotch ?? false)
+        ember.isHidden = expanded || connectedCount == 0 || !hasNotch
         if !ember.isHidden {
-            ember.position = CGPoint(x: window.frame.width / 2, y: 5)
+            ember.position = CGPoint(x: canvasWidth / 2, y: slabTop - notchHeight + 5)
         }
     }
 
@@ -435,28 +512,22 @@ final class NotchIsland {
         ceil((text as NSString).size(withAttributes: [.font: label.font ?? NSFont.systemFont(ofSize: 13)]).width)
     }
 
-    private func expandedFrame(_ g: Geometry, textWidth: CGFloat, hasIcon: Bool, hasRing: Bool) -> NSRect {
-        var w: CGFloat = 18 + textWidth + 18
-        if hasIcon { w += 22 + 10 }
-        if hasRing { w += 18 + 10 }
-        w = max(w, g.notchRect.width + 56)
-        let h = g.notchRect.height + bandHeight
-        return NSRect(x: g.screen.frame.midX - w / 2,
-                      y: g.screen.frame.maxY - h - (g.hasNotch ? 0 : 8),
-                      width: w, height: h)
-    }
-
     private func expand(symbol: String?, tint: NSColor, text: String, deadline: Date?, total: TimeInterval) {
-        guard let g = geometry() else { return }
         expanded = true
         updateEmber()
 
         label.stringValue = text
         let hasIcon = symbol != nil
         let hasRing = deadline != nil
-        let frame = expandedFrame(g, textWidth: measure(text), hasIcon: hasIcon, hasRing: hasRing)
 
-        content.frame = NSRect(x: 0, y: 0, width: frame.width, height: bandHeight)
+        var w: CGFloat = 18 + measure(text) + 18
+        if hasIcon { w += 22 + 10 }
+        if hasRing { w += 18 + 10 }
+        w = min(max(w, notchWidth + 56), canvasWidth - 24)
+        let h = notchHeight + bandHeight
+
+        // Content strip sits in the band below the notch.
+        content.frame = NSRect(x: (canvasWidth - w) / 2, y: slabTop - h, width: w, height: bandHeight)
         var x: CGFloat = 18
         iconWell.isHidden = !hasIcon
         if let symbol {
@@ -473,10 +544,10 @@ final class NotchIsland {
         }
         let ringSpace: CGFloat = hasRing ? 18 + 10 : 0
         label.frame = NSRect(x: x, y: (bandHeight - 18) / 2,
-                             width: frame.width - x - 18 - ringSpace, height: 18)
+                             width: w - x - 18 - ringSpace, height: 18)
         ringView.isHidden = !hasRing
         if let deadline {
-            ringView.frame = NSRect(x: frame.width - 18 - 18, y: (bandHeight - 18) / 2, width: 18, height: 18)
+            ringView.frame = NSRect(x: w - 18 - 18, y: (bandHeight - 18) / 2, width: 18, height: 18)
             ringArc.strokeColor = tint.cgColor
             ringArc.removeAllAnimations()
             let remaining = max(deadline.timeIntervalSinceNow, 0.1)
@@ -491,12 +562,11 @@ final class NotchIsland {
             ringArc.add(drain, forKey: "drain")
         }
 
-        // The slab becomes real only now: black fill, hairline, shadow.
-        container.layer?.backgroundColor = NSColor.black.cgColor
-        container.layer?.cornerRadius = 22
-        container.layer?.borderWidth = 1
-        container.layer?.borderColor = NSColor.white.withAlphaComponent(0.09).cgColor
-        window.hasShadow = true
+        // The slab becomes real: black fill, hairline, shadow, spring out.
+        slab.fillColor = NSColor.black.cgColor
+        slab.strokeColor = NSColor.white.withAlphaComponent(0.09).cgColor
+        slab.shadowOpacity = 0.5
+        morph(to: slabPath(centerX: canvasWidth / 2, width: w, height: h), spring: true)
 
         if hasIcon, let layer = iconWell.layer {
             let spring = CASpringAnimation(keyPath: "transform.scale")
@@ -507,79 +577,31 @@ final class NotchIsland {
             spring.duration = spring.settlingDuration
             layer.add(spring, forKey: "pop")
         }
-        let rise = label.frame
-        label.setFrameOrigin(NSPoint(x: rise.origin.x, y: rise.origin.y - 6))
-
-        if g.hasNotch {
-            // Grow out of the physical notch, not from wherever the window last was.
-            if !window.isVisible || !window.frame.intersects(g.screen.frame) {
-                window.setFrame(g.notchRect, display: true)
-            }
-            window.orderFront(nil)
-            var overshoot = frame
-            overshoot.size.width += 14
-            overshoot.size.height += 3
-            overshoot.origin.x -= 7
-            overshoot.origin.y -= 3
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.26
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                window.animator().setFrame(overshoot, display: true)
-                content.animator().alphaValue = 1
-                label.animator().setFrameOrigin(rise.origin)
-            }, completionHandler: { [weak self] in
-                NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = 0.16
-                    ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                    self?.window.animator().setFrame(frame, display: true)
-                }
-            })
-        } else {
-            window.setFrame(frame, display: true)
-            window.alphaValue = 0
-            label.alphaValue = 1
-            window.orderFront(nil)
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.22
-                window.animator().alphaValue = 1
-                content.animator().alphaValue = 1
-                label.animator().setFrameOrigin(rise.origin)
-            }
+        let rise = content.frame.origin
+        content.setFrameOrigin(NSPoint(x: rise.x, y: rise.y - 6))
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.25
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            content.animator().alphaValue = 1
+            content.animator().setFrameOrigin(rise)
         }
     }
 
     private func collapse() {
         expanded = false
-        let g = geometry()
         NSAnimationContext.runAnimationGroup({ [weak self] ctx in
-            ctx.duration = 0.14
+            ctx.duration = 0.16
             self?.content.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             guard let self else { return }
-            if let g, g.hasNotch {
-                NSAnimationContext.runAnimationGroup({ ctx in
-                    ctx.duration = 0.22
-                    ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
-                    self.window.animator().setFrame(g.notchRect, display: true)
-                }, completionHandler: { [weak self] in
-                    guard let self else { return }
-                    // Back to nothing: transparent over the physical notch.
-                    self.container.layer?.backgroundColor = NSColor.clear.cgColor
-                    self.container.layer?.cornerRadius = 10
-                    self.container.layer?.borderWidth = 0
-                    self.window.hasShadow = false
-                    self.updateEmber()
-                })
-            } else {
-                NSAnimationContext.runAnimationGroup({ ctx in
-                    ctx.duration = 0.2
-                    self.window.animator().alphaValue = 0
-                }, completionHandler: { [weak self] in
-                    guard let self else { return }
-                    self.window.orderOut(nil)
-                    self.window.alphaValue = 1
-                    self.label.alphaValue = 0
-                })
+            self.morph(to: self.collapsedPath(), spring: false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) { [weak self] in
+                guard let self, !self.expanded else { return }
+                // Back to nothing over the physical notch.
+                self.slab.fillColor = NSColor.clear.cgColor
+                self.slab.strokeColor = NSColor.clear.cgColor
+                self.slab.shadowOpacity = 0
+                self.updateEmber()
             }
         })
     }
@@ -1332,7 +1354,7 @@ final class StatusUI: NSObject {
         item.button?.title = base + (currentMode == .normal ? " N" : " P")
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "Slingshot v1.3", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Slingshot v1.4", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
 
         menu.addItem(withTitle: "Mode", action: nil, keyEquivalent: "")
@@ -1500,7 +1522,7 @@ final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
 // MARK: - Main
 
-log("Slingshot v1.3. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
+log("Slingshot v1.4. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
 
 // A real NSApplication event loop so Finder/LaunchServices see the app check in.
 // Without this, a double-clicked launch gets flagged "not responding".
