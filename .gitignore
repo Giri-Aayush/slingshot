@@ -1,6 +1,6 @@
 .build/
 .swiftpm/
-AirGrab.app/
-AirGrab.zip
+Slingshot.app/
+Slingshot.zip
 *.png
 .DS_Store
