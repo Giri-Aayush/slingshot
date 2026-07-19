@@ -10,6 +10,8 @@ https://github.com/Giri-Aayush/slingshot
 
 - **Gesture detection**: Apple's Vision framework (`VNDetectHumanHandPoseRequest`) tracks 21 hand joints from the FaceTime camera at ~15 fps. Gestures are deliberate by design: 2 s of steady open palm arms (Tink), 1 s of held fist grabs (Pop), and a drop is 1 s of fist then half a second of open hand. A moving wrist resets the timers, so waving or talking with your hands never triggers anything. Fingertips that Vision loses sight of count as curled, which keeps fist detection solid when fingers occlude themselves.
 - **Screenshot**: `/usr/sbin/screencapture` grabs the full desktop to `~/Pictures/Slingshot/`.
+- **Snap to clipboard** (opt-in, off by default): Apple's on-device sound classifier listens for a finger snap and copies a full screenshot straight to the clipboard, ready for Cmd-V. Toggle it from the menu bar. Audio is analyzed locally and never leaves the Mac.
+- **Transfer modes**: Normal embeds the grabber's face print in the hold, so the receiving Mac only completes the drop when it sees a matching face. This is a best-effort check built on Vision's image similarity, not a security boundary; the print travels encrypted to session peers and is discarded when the hold ends. Pro mode lets anyone at any connected Mac catch.
 - **Hold & catch**: a grab doesn't broadcast anything. The grabbing Mac keeps the file and tells peers "I'm holding". When another Mac's camera sees the release gesture (fist for 1 s, then open hand) within 30 s, it claims the drop and only then does the file stream to it, via MultipeerConnectivity (the same local Wi-Fi / peer-to-peer transport AirDrop uses; auto-discover, auto-connect, 8 s retries). Received files land in `~/Downloads` as `from-<sender>-grab-<timestamp>.png` and open automatically.
 - **Notch island**: feedback lives in a Dynamic Island style banner that grows out of the MacBook notch, black on black so it is invisible until something happens. It pulses for events (armed, caught, connected) and stays out while a hold is pending on either side. Macs without a notch get a floating pill instead.
 - **Feedback**: menu bar icon (✊… searching / ✊✓ connected), toast banners for connect/send/receive/errors, flash + fly-away animation on grab, zoom-up animation on receive.
@@ -22,7 +24,7 @@ There is no sender or receiver role. Every copy of the app does both, and it is 
 2. The app is signed with a development certificate, not notarized, so Gatekeeper will balk. Either:
    - run `xattr -dr com.apple.quarantine /path/to/Slingshot.app`, or
    - try to open it once, then System Settings → Privacy & Security → scroll to Security → **Open Anyway**.
-3. Open the app. Approve the **Camera** prompt and **Local Network** prompt.
+3. Open the app. Approve the **Camera** and **Local Network** prompts. Microphone is only requested if you turn on snap-to-clipboard.
 4. Grant **Screen Recording** (System Settings → Privacy & Security → Screen & System Audio Recording → enable Slingshot), then quit and reopen the app. That permission only applies at launch.
 5. Look for the **✊ icon in the menu bar**. When a second Mac on the same Wi-Fi runs the app, it flips to ✊✓ within seconds.
 

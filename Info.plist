@@ -11,9 +11,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>1.1</string>
 	<key>CFBundleVersion</key>
-	<string>10</string>
+	<string>11</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>
@@ -24,8 +24,10 @@
 		<string>_slingshot._udp</string>
 	</array>
 	<key>NSCameraUsageDescription</key>
-	<string>Slingshot watches for your palm-to-fist gesture to grab a screenshot.</string>
+	<string>Slingshot watches for your hand gestures, and in Normal mode checks that the catchers face matches the grabbers.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Slingshot finds nearby Macs running Slingshot to beam your screenshot to.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Slingshot listens for a finger snap to copy a screenshot to your clipboard. Off by default.</string>
 </dict>
 </plist>
