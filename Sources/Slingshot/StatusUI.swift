@@ -21,7 +21,7 @@ final class StatusUI: NSObject {
         item.button?.title = base + (currentMode == .normal ? " N" : " P")
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "Slingshot v2.0", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Slingshot v2.0.1", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
 
         menu.addItem(withTitle: "Mode", action: nil, keyEquivalent: "")
@@ -77,6 +77,9 @@ final class StatusUI: NSObject {
         let trustItem = NSMenuItem(title: "Reset trusted Macs", action: #selector(resetTrust), keyEquivalent: "")
         trustItem.target = self
         menu.addItem(trustItem)
+        let welcomeItem = NSMenuItem(title: "Show Welcome", action: #selector(showWelcome), keyEquivalent: "")
+        welcomeItem.target = self
+        menu.addItem(welcomeItem)
         let logItem = NSMenuItem(title: "Show Log", action: #selector(openLog), keyEquivalent: "")
         logItem.target = self
         menu.addItem(logItem)
@@ -151,6 +154,10 @@ final class StatusUI: NSObject {
     @objc private func resetTrust() {
         link.resetTrust()
         refresh()
+    }
+
+    @objc private func showWelcome() {
+        OnboardingWindow.shared.show()
     }
 
     @objc private func openFolder() {
