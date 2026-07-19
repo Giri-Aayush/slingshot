@@ -3,12 +3,12 @@
   <channel>
     <title>Slingshot</title>
     <item>
-      <title>Version 2.1.1</title>
-      <sparkle:version>28</sparkle:version>
-      <sparkle:shortVersionString>2.1.1</sparkle:shortVersionString>
+      <title>Version 2.2.0</title>
+      <sparkle:version>29</sparkle:version>
+      <sparkle:shortVersionString>2.2.0</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
-      <link>https://github.com/Giri-Aayush/slingshot/releases/tag/v2.1.1</link>
-      <enclosure url="https://github.com/Giri-Aayush/slingshot/releases/download/v2.1.1/Slingshot.zip" sparkle:edSignature="O9eSNBRFm/RIOJqUJ8A7uQm+aGn7o968cpM5dqztDKWyZQh+cN0chYFCcAtn4UbqoHpCsbEbs3nloJ+Rkfd3CA==" length="1295700" type="application/octet-stream"/>
+      <link>https://github.com/Giri-Aayush/slingshot/releases/tag/v2.2.0</link>
+      <enclosure url="https://github.com/Giri-Aayush/slingshot/releases/download/v2.2.0/Slingshot.zip" sparkle:edSignature="E5YBT4VDgGn9aE1Yd9EZxW08krnMJJzb0HSCThw2O9H7+BGl16ni128GeF4kTjNM/ddoJ8+OCUgqRSgo60MfAg==" length="1322209" type="application/octet-stream"/>
     </item>
   </channel>
 </rss>
