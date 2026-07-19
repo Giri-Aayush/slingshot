@@ -19,7 +19,7 @@ final class StatusUI: NSObject {
         item.button?.title = base + (currentMode == .normal ? " N" : " P")
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "Slingshot v1.9", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Slingshot v1.10", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
 
         menu.addItem(withTitle: "Mode", action: nil, keyEquivalent: "")
@@ -63,6 +63,9 @@ final class StatusUI: NSObject {
         let folder = NSMenuItem(title: "Open Screenshots Folder", action: #selector(openFolder), keyEquivalent: "")
         folder.target = self
         menu.addItem(folder)
+        let trustItem = NSMenuItem(title: "Reset trusted Macs", action: #selector(resetTrust), keyEquivalent: "")
+        trustItem.target = self
+        menu.addItem(trustItem)
         let logItem = NSMenuItem(title: "Show Log", action: #selector(openLog), keyEquivalent: "")
         logItem.target = self
         menu.addItem(logItem)
@@ -116,6 +119,11 @@ final class StatusUI: NSObject {
                 snapWakeOperational = false
             }
         }
+        refresh()
+    }
+
+    @objc private func resetTrust() {
+        link.resetTrust()
         refresh()
     }
 

@@ -37,9 +37,9 @@ Things we consider security issues:
 
 ## Known limitations
 
-The mesh currently auto-connects to any Mac on the same network running
-Slingshot; a peer-approval flow is planned. Until it ships, treat the app as
-trusted-network software.
+First-contact peer approval gates every connection, and received non-image
+files are revealed in Finder rather than opened. The face lock remains best
+effort and is documented as such.
 
 ## Supported versions
 

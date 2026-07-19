@@ -5,7 +5,7 @@ import Vision
 
 // MARK: - Main
 
-log("Slingshot v1.9. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
+log("Slingshot v1.10. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
 
 // A real NSApplication event loop so Finder/LaunchServices see the app check in.
 // Without this, a double-clicked launch gets flagged "not responding".

@@ -21,7 +21,10 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
     // (via the gesture engine's callbacks), and main-queue expiry closures.
     // Never call out (send, UI, log) while holding the lock.
     private let lock = NSLock()
-    private var discovered: Set<MCPeerID> = []
+    private var discovered: [MCPeerID: String] = [:]  // peer -> install ID
+    private var trustedIDs = Set(UserDefaults.standard.stringArray(forKey: "trustedPeers") ?? [])
+    private var deniedIDs: Set<String> = []       // this session only
+    private var pendingApproval: Set<String> = []
     private var heldFile: URL?
     private var holdGeneration = 0
     private var lastHoldEnd = "caught"
@@ -44,7 +47,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
     }
     var nearbyPeers: [MCPeerID] {
         let connected = session.connectedPeers
-        return lock.withLock { discovered.filter { !connected.contains($0) } }
+        return lock.withLock { Array(discovered.keys).filter { !connected.contains($0) } }
             .sorted { $0.displayName < $1.displayName }
     }
 
@@ -53,7 +56,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
         // Random suffix so two identically named MacBooks never collide.
         peerID = MCPeerID(displayName: "\(host)#\(Int.random(in: 100...999))")
         session = MCSession(peer: peerID, securityIdentity: nil, encryptionPreference: .required)
-        advertiser = MCNearbyServiceAdvertiser(peer: peerID, discoveryInfo: nil, serviceType: Self.serviceType)
+        advertiser = MCNearbyServiceAdvertiser(peer: peerID, discoveryInfo: ["iid": installID], serviceType: Self.serviceType)
         browser = MCNearbyServiceBrowser(peer: peerID, serviceType: Self.serviceType)
         super.init()
         session.delegate = self
@@ -78,12 +81,64 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
     private func retryInvites() {
         let connected = session.connectedPeers
         let candidates = lock.withLock {
-            discovered.filter { !connected.contains($0) && shouldInvite($0) }
+            discovered.filter { trustedIDs.contains($0.value) && !connected.contains($0.key) && shouldInvite($0.key) }
+                .map { $0.key }
         }
         for id in candidates {
             log("🔁 Retrying connection to \(id.displayName)…")
-            browser.invitePeer(id, to: session, withContext: nil, timeout: 15)
+            invite(id)
         }
+    }
+
+    // MARK: Trust
+
+    private func invite(_ id: MCPeerID) {
+        let context = try? JSONSerialization.data(withJSONObject: ["iid": installID])
+        browser.invitePeer(id, to: session, withContext: context, timeout: 15)
+    }
+
+    /// Prompt the user about a first-contact Mac. Serialized by the main queue.
+    private func requestApproval(name: String, verb: String, completion: @escaping (Bool) -> Void) {
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "\(name) \(verb)"
+            alert.informativeText = "Slingshot Macs exchange files with hand gestures. Allow only Macs you recognize. Approvals persist; you can reset trusted Macs from the menu bar."
+            alert.addButton(withTitle: "Allow")
+            alert.addButton(withTitle: "Deny")
+            completion(alert.runModal() == .alertFirstButtonReturn)
+        }
+    }
+
+    /// trusted, denied, pending, or ask (marking it pending)
+    private func trustStatus(of iid: String) -> String {
+        lock.withLock {
+            if trustedIDs.contains(iid) { return "trusted" }
+            if deniedIDs.contains(iid) { return "denied" }
+            if pendingApproval.contains(iid) { return "pending" }
+            pendingApproval.insert(iid)
+            return "ask"
+        }
+    }
+
+    private func resolveApproval(iid: String, allowed: Bool) {
+        lock.withLock {
+            pendingApproval.remove(iid)
+            if allowed { trustedIDs.insert(iid) } else { deniedIDs.insert(iid) }
+        }
+        if allowed {
+            UserDefaults.standard.set(Array(lock.withLock { trustedIDs }), forKey: "trustedPeers")
+        }
+    }
+
+    func resetTrust() {
+        lock.withLock {
+            trustedIDs.removeAll()
+            deniedIDs.removeAll()
+            pendingApproval.removeAll()
+        }
+        UserDefaults.standard.removeObject(forKey: "trustedPeers")
+        log("🧹 Trusted Macs reset. Next contact will ask again")
     }
 
     // MARK: Hold / catch protocol
@@ -254,16 +309,31 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
 
     func browser(_ browser: MCNearbyServiceBrowser, foundPeer id: MCPeerID, withDiscoveryInfo info: [String: String]?) {
         log("🔍 Found peer \(id.displayName)")
-        lock.withLock { _ = discovered.insert(id) }
+        let iid = info?["iid"] ?? "legacy:" + cleanName(id.displayName)
+        lock.withLock { discovered[id] = iid }
         DispatchQueue.main.async { statusUI?.refresh() }
-        if shouldInvite(id) {
-            browser.invitePeer(id, to: session, withContext: nil, timeout: 15)
+        switch trustStatus(of: iid) {
+        case "trusted":
+            if shouldInvite(id) { invite(id) }
+        case "ask":
+            requestApproval(name: cleanName(id.displayName), verb: "is nearby and can join your Slingshot room") { [weak self] allowed in
+                guard let self else { return }
+                self.resolveApproval(iid: iid, allowed: allowed)
+                if allowed {
+                    log("✅ \(id.displayName) trusted")
+                    if self.shouldInvite(id) { self.invite(id) }
+                } else {
+                    log("🚫 \(id.displayName) denied for this session")
+                }
+            }
+        default:
+            break
         }
     }
 
     func browser(_ browser: MCNearbyServiceBrowser, lostPeer id: MCPeerID) {
         log("👋 Lost sight of \(id.displayName)")
-        lock.withLock { _ = discovered.remove(id) }
+        lock.withLock { _ = discovered.removeValue(forKey: id) }
         DispatchQueue.main.async { statusUI?.refresh() }
     }
 
@@ -271,8 +341,30 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
 
     func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didReceiveInvitationFromPeer id: MCPeerID,
                     withContext context: Data?, invitationHandler: @escaping (Bool, MCSession?) -> Void) {
-        log("📨 Invitation from \(id.displayName), accepting")
-        invitationHandler(true, session)
+        let iid: String
+        if let context,
+           let dict = try? JSONSerialization.jsonObject(with: context) as? [String: String],
+           let sent = dict["iid"] {
+            iid = sent
+        } else {
+            iid = "legacy:" + cleanName(id.displayName)
+        }
+        switch trustStatus(of: iid) {
+        case "trusted":
+            log("📨 Invitation from \(id.displayName), trusted, accepting")
+            invitationHandler(true, session)
+        case "denied":
+            invitationHandler(false, nil)
+        case "ask":
+            log("📨 Invitation from \(id.displayName), asking you")
+            requestApproval(name: cleanName(id.displayName), verb: "wants to connect") { [weak self] allowed in
+                self?.resolveApproval(iid: iid, allowed: allowed)
+                log(allowed ? "✅ \(id.displayName) trusted" : "🚫 \(id.displayName) denied for this session")
+                invitationHandler(allowed, allowed ? self?.session : nil)
+            }
+        default:
+            invitationHandler(false, nil)
+        }
     }
 
     // MARK: Session
@@ -429,12 +521,15 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
                                         title: "From \(cleanName(id.displayName))",
                                         subtitle: "Saved to Downloads",
                                         deadline: nil, total: 0, persist: false)
-                if let img = NSImage(contentsOf: savedDest) {
+                let imageExts = ["png", "jpg", "jpeg", "heic", "gif", "webp", "tiff"]
+                if imageExts.contains(savedDest.pathExtension.lowercased()),
+                   let img = NSImage(contentsOf: savedDest) {
                     animateReceive(image: img) {
                         NSWorkspace.shared.open(savedDest)
                     }
                 } else {
-                    NSWorkspace.shared.open(savedDest)
+                    // Never launch arbitrary received files; show them instead.
+                    NSWorkspace.shared.activateFileViewerSelecting([savedDest])
                 }
             }
         } catch {

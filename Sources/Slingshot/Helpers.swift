@@ -45,6 +45,16 @@ func play(_ name: String) {
     NSSound(named: NSSound.Name(name))?.play()
 }
 
+/// Stable per-install identity used for peer trust; peer display names carry a
+/// random suffix each launch, so trust must key on something durable.
+let installID: String = {
+    let defaults = UserDefaults.standard
+    if let id = defaults.string(forKey: "installID") { return id }
+    let id = UUID().uuidString
+    defaults.set(id, forKey: "installID")
+    return id
+}()
+
 func cleanName(_ s: String) -> String {
     s.components(separatedBy: "#").first ?? s
 }
