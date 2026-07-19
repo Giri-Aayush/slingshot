@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>Slingshot</title>
+    <item>
+      <title>Version 2.0.0</title>
+      <sparkle:version>25</sparkle:version>
+      <sparkle:shortVersionString>2.0.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <link>https://github.com/Giri-Aayush/slingshot/releases/tag/v2.0.0</link>
+      <enclosure url="https://github.com/Giri-Aayush/slingshot/releases/download/v2.0.0/Slingshot.zip" sparkle:edSignature="nUXeR4z4lDSeHKYTe1GqEcZF+JfIsgqoSuXuRkOj/NvcyNxpoJ+/SdiMVZqw6cvEQobz4f0jWAtx+pCbk+/WAg==" length="1290248" type="application/octet-stream"/>
+    </item>
+  </channel>
+</rss>
