@@ -302,6 +302,8 @@ final class NotchIsland {
         case compact(symbol: String?, tint: NSColor, word: String, pulsing: Bool)
         case tray(image: NSImage?, symbol: String?, tint: NSColor,
                   title: String, subtitle: String, deadline: Date?, total: TimeInterval)
+        case progressTray(image: NSImage?, symbol: String?, tint: NSColor,
+                          title: String, subtitle: String, progress: Progress)
     }
 
     private let window: NSWindow
@@ -338,6 +340,7 @@ final class NotchIsland {
     private var ringTimer: Timer?
     private var ringDeadline: Date?
     private var ringTint: NSColor = Palette.ice
+    private var progressObservation: NSKeyValueObservation?
 
     private var collapseWork: DispatchWorkItem?
     private var persistentFace: Face?
@@ -669,6 +672,25 @@ final class NotchIsland {
         collapse()
     }
 
+    /// A live transfer: the tray ring becomes a progress ring. Persists until
+    /// endTransfer() or clearPersist().
+    func transferTray(image: NSImage?, symbol: String?, tint: NSColor,
+                      title: String, subtitle: String, progress: Progress) {
+        let face = Face.progressTray(image: image, symbol: symbol, tint: tint,
+                                     title: title, subtitle: subtitle, progress: progress)
+        persistentFace = face
+        collapseWork?.cancel()
+        show(face)
+    }
+
+    /// The transfer ended; drop the standing face without collapsing, so an
+    /// outcome pulse can take over cleanly.
+    func endTransfer() {
+        progressObservation?.invalidate()
+        progressObservation = nil
+        persistentFace = nil
+    }
+
     func setPresence(_ connected: Int) {
         connectedCount = connected
         layoutBeads()
@@ -786,6 +808,9 @@ final class NotchIsland {
         case let .tray(image, symbol, tint, title, subtitle, deadline, total):
             showTray(image: image, symbol: symbol, tint: tint, title: title,
                      subtitle: subtitle, deadline: deadline, total: total)
+        case let .progressTray(image, symbol, tint, title, subtitle, progress):
+            showTray(image: image, symbol: symbol, tint: tint, title: title,
+                     subtitle: subtitle, deadline: nil, total: 0, progress: progress)
         }
     }
 
@@ -834,11 +859,12 @@ final class NotchIsland {
     }
 
     private func showTray(image: NSImage?, symbol: String?, tint: NSColor, title: String,
-                          subtitle: String, deadline: Date?, total: TimeInterval) {
+                          subtitle: String, deadline: Date?, total: TimeInterval,
+                          progress: Progress? = nil) {
         materialize()
         wingView.alphaValue = 0
 
-        let hasRing = deadline != nil
+        let hasRing = deadline != nil || progress != nil
         let w = trayWidth
         let h = notchHeight + trayBand
 
@@ -871,7 +897,21 @@ final class NotchIsland {
 
         ringView.isHidden = !hasRing
         stopRingTimer()
-        if let deadline {
+        if let progress {
+            ringView.frame = NSRect(x: w - 24 - 14, y: (trayBand - 24) / 2, width: 24, height: 24)
+            ringArc.strokeColor = tint.cgColor
+            ringArc.removeAllAnimations()
+            ringArc.strokeEnd = CGFloat(progress.fractionCompleted)
+            ringNumeral.isHidden = false
+            ringNumeral.textColor = tint
+            progressObservation = progress.observe(\.fractionCompleted, options: [.initial]) { [weak self] p, _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.ringArc.strokeEnd = CGFloat(p.fractionCompleted)
+                    self.ringNumeral.stringValue = "\(Int(p.fractionCompleted * 100))"
+                }
+            }
+        } else if let deadline {
             ringView.frame = NSRect(x: w - 24 - 14, y: (trayBand - 24) / 2, width: 24, height: 24)
             ringTint = tint
             ringDeadline = deadline
@@ -943,6 +983,8 @@ final class NotchIsland {
         ringTimer = nil
         ringDeadline = nil
         ringNumeral.isHidden = true
+        progressObservation?.invalidate()
+        progressObservation = nil
     }
 
     // MARK: Collapse
@@ -1343,9 +1385,11 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
 
     private var remoteHolders: [MCPeerID: RemoteHold] = [:]
     private var grabMutedUntil = Date.distantPast
+    private var transfersActive = 0
 
     var isHolding: Bool { lock.withLock { heldFile != nil } }
-    var grabMuted: Bool { lock.withLock { Date() < grabMutedUntil } }
+    var grabMuted: Bool { lock.withLock { Date() < grabMutedUntil || transfersActive > 0 } }
+    var hasActiveTransfers: Bool { lock.withLock { transfersActive > 0 } }
     var hasRemoteHold: Bool {
         let now = Date()
         return lock.withLock { remoteHolders.values.contains { now < $0.deadline } }
@@ -1524,7 +1568,10 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             .joined(separator: "-")
         let name = "from-\(sender)-\(url.lastPathComponent)"
         log("🚀 Beaming \(name) to \(peer.displayName)…")
-        session.sendResource(at: url, withName: name, toPeer: peer) { error in
+        lock.withLock { transfersActive += 1 }
+        let progress = session.sendResource(at: url, withName: name, toPeer: peer) { [weak self] error in
+            self?.lock.withLock { self?.transfersActive -= 1 }
+            DispatchQueue.main.async { NotchIsland.shared.endTransfer() }
             if let error {
                 log("❌ Send to \(peer.displayName) failed: \(error.localizedDescription)")
                 DispatchQueue.main.async {
@@ -1536,9 +1583,24 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
                     NotchIsland.shared.compact("checkmark.seal.fill", NotchIsland.Palette.mint, "Sent", kind: .outcome)
                     play("Purr")
                 }
-                scheduleWorkDoneSleep()
+            }
+            self?.scheduleSleepAfterTransfer()
+        }
+        // Screenshots finish in a blink; only long transfers earn the progress tray.
+        if let progress {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                guard !progress.isFinished, !progress.isCancelled else { return }
+                let thumb = NSImage(contentsOf: url) ?? NSWorkspace.shared.icon(forFile: url.path)
+                NotchIsland.shared.transferTray(image: thumb, symbol: "arrow.up.circle.fill",
+                                                tint: NotchIsland.Palette.ice,
+                                                title: "Sending to \(cleanName(peer.displayName))",
+                                                subtitle: url.lastPathComponent, progress: progress)
             }
         }
+    }
+
+    private func scheduleSleepAfterTransfer() {
+        scheduleWorkDoneSleep()
     }
 
     // MARK: Browser
@@ -1660,10 +1722,20 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
     func session(_ session: MCSession, didStartReceivingResourceWithName name: String,
                  fromPeer id: MCPeerID, with progress: Progress) {
         log("📥 Receiving \(name) from \(id.displayName)…")
+        lock.withLock { transfersActive += 1 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            guard !progress.isFinished, !progress.isCancelled else { return }
+            NotchIsland.shared.transferTray(image: nil, symbol: "arrow.down.circle.fill",
+                                            tint: NotchIsland.Palette.mint,
+                                            title: "Receiving from \(cleanName(id.displayName))",
+                                            subtitle: name, progress: progress)
+        }
     }
 
     func session(_ session: MCSession, didFinishReceivingResourceWithName name: String,
                  fromPeer id: MCPeerID, at localURL: URL?, withError error: Error?) {
+        lock.withLock { transfersActive -= 1 }
+        DispatchQueue.main.async { NotchIsland.shared.endTransfer() }
         if let error {
             log("❌ Receive failed: \(error.localizedDescription)")
             return
@@ -1724,7 +1796,7 @@ final class StatusUI: NSObject {
         item.button?.title = base + (currentMode == .normal ? " N" : " P")
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "Slingshot v1.7", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Slingshot v1.8", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
 
         menu.addItem(withTitle: "Mode", action: nil, keyEquivalent: "")
@@ -1892,7 +1964,7 @@ final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
 // MARK: - Main
 
-log("Slingshot v1.7. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
+log("Slingshot v1.8. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
 
 // A real NSApplication event loop so Finder/LaunchServices see the app check in.
 // Without this, a double-clicked launch gets flagged "not responding".
@@ -1930,7 +2002,7 @@ func wakeCamera(_ reason: String) {
 
 func sleepCamera(_ reason: String) {
     guard snapWakeEnabled, let cam = camera, cam.isRunning else { return }
-    guard !link.isHolding, !link.hasRemoteHold else { return }
+    guard !link.isHolding, !link.hasRemoteHold, !link.hasActiveTransfers else { return }
     cam.stop()
     frameStore.clear()
     log("😴 Camera asleep (\(reason)). Snap to wake")
