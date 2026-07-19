@@ -283,6 +283,14 @@ final class NotchIsland {
                                                object: nil, queue: .main) { [weak self] _ in
             self?.reanchor()
         }
+
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            guard let self, self.expanded, self.persistentFace == nil, self.collapseWork == nil else { return }
+            self.hovering = false
+            self.transientRank = 0
+            self.transientUntil = .distantPast
+            self.collapse()
+        }
     }
 
     // MARK: Anchoring
@@ -339,6 +347,12 @@ final class NotchIsland {
             setPaths(collapsedPath())
         } else if let face = persistentFace {
             show(face)
+        } else {
+            // A transient was up when the screens changed; its geometry is stale.
+            collapseWork?.cancel()
+            transientRank = 0
+            transientUntil = .distantPast
+            collapse()
         }
         layoutBeads()
     }
@@ -502,6 +516,7 @@ final class NotchIsland {
     }
 
     private func settle() {
+        collapseWork = nil
         transientRank = 0
         transientUntil = .distantPast
         if hovering {
