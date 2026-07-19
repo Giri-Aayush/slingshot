@@ -228,16 +228,17 @@ func animateReceive(image: NSImage, then completion: @escaping () -> Void) {
 
 // MARK: - Notch island
 
-/// A Dynamic Island that grows out of the MacBook notch, speaking two visual
-/// grammars. Compact: quick events live in the wings beside the notch, a glyph
-/// on the left and a short tinted word on the right, at notch height. Tray:
-/// standing states open a full panel below the notch with a screenshot
-/// thumbnail, title, instruction subtitle, and the countdown ring.
+/// The Slingshot Dynamic Island, per the v1.0 design specification.
 ///
-/// The hosting window is a fixed transparent canvas; one CAShapeLayer slab
-/// morphs between silhouettes with a real spring. The flared-top shape is the
-/// boring.notch family look, implemented independently. At rest nothing draws
-/// except the ember heartbeat when peers are connected.
+/// Layout laws: nothing renders inside the physical notch band; compact content
+/// lives in the wings, tray content in the band below. Collapsed draws nothing.
+/// Tint is reserved for the compact word, glyphs, ring, and badges; body text is
+/// white or gray. Every tray is exactly 340pt wide so states never jitter.
+///
+/// Transients come in three classes with an interrupt order: outcome beats
+/// prompt beats status. Standing trays (holds) sit underneath and resume when
+/// a transient ends. Prompts pulse their glyph; states never pulse.
+
 /// An invisible window covering exactly the physical notch. The notch is dead
 /// pixels, so it can accept mouse hover and file drops without stealing a
 /// single click from real UI.
@@ -272,6 +273,20 @@ private final class NotchSensorView: NSView {
     }
 }
 
+enum IslandClass: Int {
+    case status = 1   // Armed, Connected, Catching, awake eye, hover peek
+    case prompt = 2   // Open hand, Show face, Snap to wake, Drop to hold
+    case outcome = 3  // Sent, Copied, Received, Blocked, Too late, Expired, failures
+
+    var dwell: TimeInterval {
+        switch self {
+        case .status: return 1.8
+        case .prompt: return 2.6
+        case .outcome: return 2.4
+        }
+    }
+}
+
 final class NotchIsland {
     static let shared = NotchIsland()
 
@@ -284,24 +299,34 @@ final class NotchIsland {
     }
 
     private enum Face {
-        case compact(symbol: String?, tint: NSColor, word: String)
+        case compact(symbol: String?, tint: NSColor, word: String, pulsing: Bool)
         case tray(image: NSImage?, symbol: String?, tint: NSColor,
                   title: String, subtitle: String, deadline: Date?, total: TimeInterval)
     }
 
     private let window: NSWindow
     private let canvas = NSView()
+
+    // The slab: three synchronized path layers (deep shadow, contact shadow,
+    // black fill) plus a gradient hairline masked to the outline.
+    private let deepShadow = CAShapeLayer()
+    private let contactShadow = CAShapeLayer()
     private let slab = CAShapeLayer()
-    private let ember = CALayer()
+    private let hairline = CAGradientLayer()
+    private let hairlineMask = CAShapeLayer()
+    private var pathLayers: [CAShapeLayer] { [deepShadow, contactShadow, slab, hairlineMask] }
+
+    private let beadRow = CALayer()
+    private var beads: [CALayer] = []
 
     // Compact face: wings beside the notch.
     private let wingView = NSView()
     private let wingIcon = NSImageView()
     private let wingLabel = NSTextField(labelWithString: "")
 
-    // Tray face: panel below the notch.
+    // Tray face: panel below the notch, always trayWidth wide.
     private let trayView = NSView()
-    private let trayThumb = NSImageView()
+    private let trayThumb = NSView()
     private let trayWell = NSView()
     private let trayWellIcon = NSImageView()
     private let trayTitle = NSTextField(labelWithString: "")
@@ -309,12 +334,18 @@ final class NotchIsland {
     private let ringView = NSView()
     private let ringTrack = CAShapeLayer()
     private let ringArc = CAShapeLayer()
+    private let ringNumeral = NSTextField(labelWithString: "")
+    private var ringTimer: Timer?
+    private var ringDeadline: Date?
+    private var ringTint: NSColor = Palette.ice
 
     private var collapseWork: DispatchWorkItem?
     private var persistentFace: Face?
     private var connectedCount = 0
     private var expanded = false
     private var hovering = false
+    private var transientRank = 0
+    private var transientUntil = Date.distantPast
     private var sensorWindow: NSWindow?
     private let sensorView = NotchSensorView()
 
@@ -324,10 +355,10 @@ final class NotchIsland {
     var onDropFile: (URL) -> Void = { _ in }
 
     private let trayBand: CGFloat = 64
+    private let trayWidth: CGFloat = 340
     private let canvasWidth: CGFloat = 800
     private let canvasHeight: CGFloat = 140
     private let topFlare: CGFloat = 8
-    private let bottomRadius: CGFloat = 18
 
     private var notchWidth: CGFloat = 200
     private var notchHeight: CGFloat = 32
@@ -355,32 +386,45 @@ final class NotchIsland {
         canvas.wantsLayer = true
         window.contentView = canvas
 
-        slab.fillColor = NSColor.clear.cgColor
-        slab.strokeColor = NSColor.clear.cgColor
-        slab.lineWidth = 1
-        slab.shadowColor = NSColor.black.cgColor
-        slab.shadowOpacity = 0
-        slab.shadowRadius = 12
-        slab.shadowOffset = CGSize(width: 0, height: -5)
-        canvas.layer?.addSublayer(slab)
+        // Two-part shadow: soft ambient depth plus a tight contact line.
+        deepShadow.fillColor = NSColor.black.cgColor
+        deepShadow.shadowColor = NSColor.black.cgColor
+        deepShadow.shadowRadius = 18
+        deepShadow.shadowOpacity = 0.35
+        deepShadow.shadowOffset = CGSize(width: 0, height: -6)
+        contactShadow.fillColor = NSColor.black.cgColor
+        contactShadow.shadowColor = NSColor.black.cgColor
+        contactShadow.shadowRadius = 3
+        contactShadow.shadowOpacity = 0.6
+        contactShadow.shadowOffset = CGSize(width: 0, height: -1)
+        slab.fillColor = NSColor.black.cgColor
 
-        ember.bounds = CGRect(x: 0, y: 0, width: 4, height: 4)
-        ember.cornerRadius = 2
-        ember.backgroundColor = Palette.ice.cgColor
-        ember.shadowColor = Palette.ice.cgColor
-        ember.shadowRadius = 4
-        ember.shadowOpacity = 0.9
-        ember.shadowOffset = .zero
-        ember.isHidden = true
-        let pulse = CABasicAnimation(keyPath: "opacity")
-        pulse.fromValue = 0.25
-        pulse.toValue = 0.75
-        pulse.duration = 2.2
-        pulse.autoreverses = true
-        pulse.repeatCount = .infinity
-        pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        ember.add(pulse, forKey: "breathe")
-        canvas.layer?.addSublayer(ember)
+        // Gradient hairline: faint against the menu bar, brighter where the
+        // slab's lower edge meets the wallpaper.
+        hairline.colors = [NSColor.white.withAlphaComponent(0.06).cgColor,
+                           NSColor.white.withAlphaComponent(0.22).cgColor]
+        hairline.startPoint = CGPoint(x: 0.5, y: 1)
+        hairline.endPoint = CGPoint(x: 0.5, y: 0)
+        hairlineMask.fillColor = NSColor.clear.cgColor
+        hairlineMask.strokeColor = NSColor.black.cgColor
+        hairlineMask.lineWidth = 1
+        hairline.mask = hairlineMask
+
+        for layer in [deepShadow, contactShadow, slab, hairline] {
+            canvas.layer?.addSublayer(layer)
+        }
+        setSlabVisible(false)
+
+        // Peer beads at the notch's bottom edge, one per connected Mac.
+        let breathe = CABasicAnimation(keyPath: "opacity")
+        breathe.fromValue = 0.45
+        breathe.toValue = 0.8
+        breathe.duration = 3.0
+        breathe.autoreverses = true
+        breathe.repeatCount = .infinity
+        breathe.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        beadRow.add(breathe, forKey: "breathe")
+        canvas.layer?.addSublayer(beadRow)
 
         // Compact wings
         wingView.alphaValue = 0
@@ -394,13 +438,13 @@ final class NotchIsland {
 
         // Tray panel
         trayView.alphaValue = 0
-        trayThumb.imageScaling = .scaleProportionallyUpOrDown
         trayThumb.wantsLayer = true
         trayThumb.layer?.cornerRadius = 8
         trayThumb.layer?.cornerCurve = .continuous
         trayThumb.layer?.masksToBounds = true
         trayThumb.layer?.borderWidth = 1
         trayThumb.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        trayThumb.layer?.contentsGravity = .resizeAspectFill
         trayView.addSubview(trayThumb)
 
         trayWell.wantsLayer = true
@@ -413,7 +457,7 @@ final class NotchIsland {
 
         trayTitle.font = roundedFont(13, .bold)
         trayTitle.textColor = NSColor(white: 0.95, alpha: 1)
-        trayTitle.lineBreakMode = .byTruncatingTail
+        trayTitle.lineBreakMode = .byTruncatingMiddle
         trayView.addSubview(trayTitle)
 
         traySub.font = roundedFont(11, .regular)
@@ -433,17 +477,24 @@ final class NotchIsland {
             ringView.layer?.addSublayer(layer)
         }
         ringTrack.strokeColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        ringNumeral.font = roundedFont(9, .semibold)
+        ringNumeral.alignment = .center
+        ringNumeral.frame = NSRect(x: 0, y: 5, width: 24, height: 12)
+        ringNumeral.isHidden = true
+        ringView.addSubview(ringNumeral)
         trayView.addSubview(ringView)
 
         sensorView.registerForDraggedTypes([.fileURL])
         sensorView.onEnter = { [weak self] in self?.hoverPeek() }
         sensorView.onExit = { [weak self] in self?.hoverEnd() }
         sensorView.onDragEnter = { [weak self] in
-            self?.collapseWork?.cancel()
-            self?.show(.tray(image: nil, symbol: "plus.circle.fill", tint: Palette.ice,
-                             title: "Drop to hold",
-                             subtitle: "Release, then fist and open at another Mac",
-                             deadline: nil, total: 0))
+            guard let self else { return }
+            self.collapseWork?.cancel()
+            self.beginTransient(.prompt)
+            self.show(.tray(image: nil, symbol: "plus.circle.fill", tint: Palette.ice,
+                            title: "Drop to hold",
+                            subtitle: "Release, then fist and open at another Mac",
+                            deadline: nil, total: 0))
         }
         sensorView.onDrop = { [weak self] url in self?.onDropFile(url) }
 
@@ -454,22 +505,8 @@ final class NotchIsland {
         }
     }
 
-    /// Hover over the notch: peek at status, unless a hold is already showing.
-    private func hoverPeek() {
-        hovering = true
-        guard persistentFace == nil else { return }
-        collapseWork?.cancel()
-        let status = statusProvider()
-        show(.tray(image: nil, symbol: "hand.raised.fill", tint: Palette.ice,
-                   title: status.title, subtitle: status.subtitle, deadline: nil, total: 0))
-    }
+    // MARK: Anchoring
 
-    private func hoverEnd() {
-        hovering = false
-        scheduleSettle(after: 0.3)
-    }
-
-    /// Pin the fixed canvas over the current notch (or top-center, notchless).
     private func reanchor() {
         let notchScreen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 }
         guard let screen = notchScreen ?? NSScreen.main else {
@@ -492,7 +529,9 @@ final class NotchIsland {
                            width: canvasWidth, height: canvasHeight)
         window.setFrame(frame, display: true)
         window.orderFront(nil)
-        slab.frame = canvas.bounds
+        for layer in pathLayers { layer.frame = canvas.bounds }
+        hairline.frame = canvas.bounds
+        hairlineMask.frame = canvas.bounds
 
         if hasNotch {
             let notchFrame = NSRect(x: screen.frame.midX - notchWidth / 2,
@@ -515,24 +554,29 @@ final class NotchIsland {
         } else {
             sensorWindow?.orderOut(nil)
         }
+
         if !expanded {
-            slab.path = collapsedPath()
+            setPaths(collapsedPath())
         } else if let face = persistentFace {
             show(face)
         }
-        updateEmber()
+        layoutBeads()
     }
 
-    /// The island silhouette: top edge widest, concave flares at the top
-    /// corners, convex rounds at the bottom. Constant segment structure, so
-    /// paths interpolate cleanly in a spring.
+    // MARK: Silhouette
+
+    /// Radius scales with height: 12pt compact, 18pt tray.
+    private func bottomRadius(forHeight h: CGFloat) -> CGFloat {
+        h > notchHeight + 8 ? 18 : 12
+    }
+
     private func slabPath(centerX: CGFloat, width: CGFloat, height: CGFloat) -> CGPath {
         let minX = centerX - width / 2
         let maxX = centerX + width / 2
         let topY = slabTop
         let bottomY = slabTop - height
         let tr = min(topFlare, width / 4, height / 2)
-        let br = min(bottomRadius, width / 4 - tr, height / 2)
+        let br = min(bottomRadius(forHeight: height), width / 4 - tr, height / 2)
 
         let p = CGMutablePath()
         p.move(to: CGPoint(x: minX, y: topY))
@@ -555,48 +599,65 @@ final class NotchIsland {
         slabPath(centerX: canvasWidth / 2, width: notchWidth, height: max(notchHeight, 0.5))
     }
 
-    private func morph(to path: CGPath, spring: Bool) {
-        let from = slab.presentation()?.path ?? slab.path
-        let anim: CAAnimation
-        if spring {
-            let sa = CASpringAnimation(keyPath: "path")
-            sa.fromValue = from
-            sa.toValue = path
-            sa.mass = 1
-            sa.stiffness = 270
-            sa.damping = 26
-            sa.duration = sa.settlingDuration
-            anim = sa
-        } else {
-            let ba = CABasicAnimation(keyPath: "path")
-            ba.fromValue = from
-            ba.toValue = path
-            ba.duration = 0.25
-            ba.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            anim = ba
+    private func setPaths(_ path: CGPath) {
+        for layer in pathLayers { layer.path = path }
+    }
+
+    private func setSlabVisible(_ visible: Bool) {
+        let opacity: Float = visible ? 1 : 0
+        for layer in [deepShadow, contactShadow, slab, hairline] {
+            layer.opacity = opacity
         }
-        slab.path = path
-        slab.add(anim, forKey: "morph")
+    }
+
+    private func morph(to path: CGPath, spring: Bool) {
+        for layer in pathLayers {
+            let from = layer.presentation()?.path ?? layer.path
+            let anim: CAAnimation
+            if spring {
+                let sa = CASpringAnimation(keyPath: "path")
+                sa.fromValue = from
+                sa.toValue = path
+                sa.mass = 1
+                sa.stiffness = 270
+                sa.damping = 26
+                sa.duration = sa.settlingDuration
+                anim = sa
+            } else {
+                let ba = CABasicAnimation(keyPath: "path")
+                ba.fromValue = from
+                ba.toValue = path
+                ba.duration = 0.22
+                ba.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                anim = ba
+            }
+            layer.path = path
+            layer.add(anim, forKey: "morph")
+        }
     }
 
     // MARK: Public API
 
-    /// Quick event: glyph in the left wing, short tinted word in the right wing.
-    func compact(_ symbol: String?, _ tint: NSColor, _ word: String, seconds: TimeInterval = 2.2) {
-        show(.compact(symbol: symbol, tint: tint, word: word))
-        scheduleSettle(after: seconds)
+    /// Quick event in the wings. Status by default; prompts pulse their glyph.
+    func compact(_ symbol: String?, _ tint: NSColor, _ word: String,
+                 kind: IslandClass = .status, pulsing: Bool = false, seconds: TimeInterval? = nil) {
+        guard beginTransient(kind) else { return }
+        show(.compact(symbol: symbol, tint: tint, word: word, pulsing: pulsing))
+        scheduleSettle(after: seconds ?? kind.dwell)
     }
 
-    /// Standing state or rich moment: thumbnail, title, subtitle, optional ring.
+    /// Standing hold or rich moment below the notch. Always 340pt wide.
     func tray(image: NSImage?, symbol: String?, tint: NSColor, title: String, subtitle: String,
-              deadline: Date?, total: TimeInterval, persist: Bool, seconds: TimeInterval = 5) {
+              deadline: Date?, total: TimeInterval, persist: Bool,
+              kind: IslandClass = .outcome, seconds: TimeInterval = 4.5) {
         let face = Face.tray(image: image, symbol: symbol, tint: tint,
                              title: title, subtitle: subtitle, deadline: deadline, total: total)
         if persist {
             persistentFace = face
             collapseWork?.cancel()
-            show(face)
+            if Date() >= transientUntil { show(face) }
         } else {
+            guard beginTransient(kind) else { return }
             show(face)
             scheduleSettle(after: seconds)
         }
@@ -610,14 +671,24 @@ final class NotchIsland {
 
     func setPresence(_ connected: Int) {
         connectedCount = connected
-        updateEmber()
+        layoutBeads()
     }
 
     func transient(_ text: String, for seconds: TimeInterval = 2.6) {
-        compact(nil, Palette.ash, String(text.prefix(28)), seconds: seconds)
+        compact(nil, Palette.ash, String(text.prefix(28)), kind: .status, seconds: seconds)
     }
 
-    // MARK: Choreography
+    // MARK: Interrupt order
+
+    @discardableResult
+    private func beginTransient(_ kind: IslandClass) -> Bool {
+        let now = Date()
+        if now < transientUntil && kind.rawValue < transientRank { return false }
+        transientRank = kind.rawValue
+        transientUntil = now.addingTimeInterval(kind.dwell)
+        collapseWork?.cancel()
+        return true
+    }
 
     private func scheduleSettle(after seconds: TimeInterval) {
         collapseWork?.cancel()
@@ -627,60 +698,129 @@ final class NotchIsland {
     }
 
     private func settle() {
-        if let face = persistentFace {
+        transientRank = 0
+        transientUntil = .distantPast
+        if hovering {
+            hoverPeek()
+        } else if let face = persistentFace {
             show(face)
         } else {
             collapse()
         }
     }
 
-    private func updateEmber() {
-        ember.isHidden = expanded || connectedCount == 0 || !hasNotch
-        if !ember.isHidden {
-            ember.position = CGPoint(x: canvasWidth / 2, y: slabTop - notchHeight + 5)
+    // MARK: Hover
+
+    private func hoverPeek() {
+        hovering = true
+        guard persistentFace == nil, Date() >= transientUntil else { return }
+        collapseWork?.cancel()
+        let status = statusProvider()
+        show(.tray(image: nil, symbol: "hand.raised.fill", tint: Palette.ice,
+                   title: status.title, subtitle: status.subtitle, deadline: nil, total: 0))
+    }
+
+    private func hoverEnd() {
+        hovering = false
+        scheduleSettle(after: 0.3)
+    }
+
+    // MARK: Peer beads
+
+    private func layoutBeads() {
+        let target = hasNotch && !expanded ? min(connectedCount, 7) : 0
+        while beads.count < target {
+            let bead = CALayer()
+            bead.bounds = CGRect(x: 0, y: 0, width: 3.5, height: 3.5)
+            bead.cornerRadius = 1.75
+            bead.backgroundColor = Palette.ice.cgColor
+            bead.shadowColor = Palette.ice.cgColor
+            bead.shadowRadius = 3
+            bead.shadowOpacity = 0.8
+            bead.shadowOffset = .zero
+            beadRow.addSublayer(bead)
+            beads.append(bead)
+            let pop = CASpringAnimation(keyPath: "transform.scale")
+            pop.fromValue = 0
+            pop.toValue = 1
+            pop.damping = 12
+            pop.stiffness = 380
+            pop.duration = pop.settlingDuration
+            bead.add(pop, forKey: "join")
+        }
+        while beads.count > target {
+            let bead = beads.removeLast()
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = 1
+            fade.toValue = 0
+            fade.duration = 0.3
+            fade.fillMode = .forwards
+            fade.isRemovedOnCompletion = false
+            bead.add(fade, forKey: "leave")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) { bead.removeFromSuperlayer() }
+        }
+        let spacing: CGFloat = 7
+        let totalW = CGFloat(max(beads.count - 1, 0)) * spacing
+        for (i, bead) in beads.enumerated() {
+            bead.position = CGPoint(x: canvasWidth / 2 - totalW / 2 + CGFloat(i) * spacing,
+                                    y: slabTop - notchHeight + 5)
         }
     }
+
+    // MARK: Faces
 
     private func width(of text: String, font: NSFont) -> CGFloat {
         ceil((text as NSString).size(withAttributes: [.font: font]).width)
     }
 
     private func materialize() {
-        slab.fillColor = NSColor.black.cgColor
-        slab.strokeColor = NSColor.white.withAlphaComponent(0.09).cgColor
-        slab.shadowOpacity = 0.5
+        setSlabVisible(true)
         expanded = true
-        updateEmber()
+        layoutBeads()
     }
 
     private func show(_ face: Face) {
         switch face {
-        case let .compact(symbol, tint, word):
-            showCompact(symbol: symbol, tint: tint, word: word)
+        case let .compact(symbol, tint, word, pulsing):
+            showCompact(symbol: symbol, tint: tint, word: word, pulsing: pulsing)
         case let .tray(image, symbol, tint, title, subtitle, deadline, total):
             showTray(image: image, symbol: symbol, tint: tint, title: title,
                      subtitle: subtitle, deadline: deadline, total: total)
         }
     }
 
-    private func showCompact(symbol: String?, tint: NSColor, word: String) {
+    private func showCompact(symbol: String?, tint: NSColor, word: String, pulsing: Bool) {
         materialize()
+        stopRingTimer()
         trayView.alphaValue = 0
 
         let h = max(notchHeight, 26)
-        let wordW = width(of: word, font: wingLabel.font ?? NSFont.systemFont(ofSize: 11))
+        let wordW = word.isEmpty ? 0 : width(of: word, font: wingLabel.font ?? NSFont.systemFont(ofSize: 11))
         let leftWing: CGFloat = symbol != nil ? 8 + 18 + 8 : 10
-        let rightWing: CGFloat = 10 + wordW + 12
+        let rightWing: CGFloat = word.isEmpty ? leftWing : 10 + wordW + 12
         let w = notchWidth + leftWing + rightWing
         let centerX = canvasWidth / 2 + (rightWing - leftWing) / 2
 
         wingView.frame = NSRect(x: centerX - w / 2, y: slabTop - h, width: w, height: h)
         wingIcon.isHidden = symbol == nil
+        wingIcon.layer?.removeAnimation(forKey: "promptPulse")
         if let symbol {
             wingIcon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
             wingIcon.contentTintColor = tint
             wingIcon.frame = NSRect(x: 8, y: (h - 18) / 2, width: 18, height: 18)
+            if pulsing {
+                wingIcon.wantsLayer = true
+                let pulse = CABasicAnimation(keyPath: "opacity")
+                pulse.fromValue = 0.6
+                pulse.toValue = 1.0
+                pulse.duration = 1.2
+                pulse.autoreverses = true
+                pulse.repeatCount = .infinity
+                pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                wingIcon.layer?.add(pulse, forKey: "promptPulse")
+            }
         }
+        wingLabel.isHidden = word.isEmpty
         wingLabel.stringValue = word
         wingLabel.textColor = tint
         wingLabel.frame = NSRect(x: w - wordW - 12, y: (h - 14) / 2, width: wordW, height: 14)
@@ -699,12 +839,7 @@ final class NotchIsland {
         wingView.alphaValue = 0
 
         let hasRing = deadline != nil
-        let leadW: CGFloat = image != nil ? 52 : (symbol != nil ? 32 : 0)
-        let textW = max(width(of: title, font: trayTitle.font ?? NSFont.systemFont(ofSize: 13)),
-                        width(of: subtitle, font: traySub.font ?? NSFont.systemFont(ofSize: 11)))
-        var w = 16 + (leadW > 0 ? leadW + 12 : 0) + min(textW, 320) + 16
-        if hasRing { w += 24 + 14 }
-        w = min(max(w, notchWidth + 120), canvasWidth - 24)
+        let w = trayWidth
         let h = notchHeight + trayBand
 
         trayView.frame = NSRect(x: (canvasWidth - w) / 2, y: slabTop - h, width: w, height: trayBand)
@@ -712,9 +847,9 @@ final class NotchIsland {
         trayThumb.isHidden = image == nil
         trayWell.isHidden = !(image == nil && symbol != nil)
         if let image {
-            trayThumb.image = image
-            trayThumb.frame = NSRect(x: x, y: (trayBand - 34) / 2, width: 52, height: 34)
-            x += 52 + 12
+            trayThumb.layer?.contents = image
+            trayThumb.frame = NSRect(x: x, y: (trayBand - 35) / 2, width: 56, height: 35)
+            x += 56 + 12
         } else if let symbol {
             trayWell.frame = NSRect(x: x, y: (trayBand - 32) / 2, width: 32, height: 32)
             trayWellIcon.frame = trayWell.bounds
@@ -735,8 +870,11 @@ final class NotchIsland {
         traySub.frame = NSRect(x: x, y: trayBand / 2 - 16, width: textWidth, height: 14)
 
         ringView.isHidden = !hasRing
+        stopRingTimer()
         if let deadline {
             ringView.frame = NSRect(x: w - 24 - 14, y: (trayBand - 24) / 2, width: 24, height: 24)
+            ringTint = tint
+            ringDeadline = deadline
             ringArc.strokeColor = tint.cgColor
             ringArc.removeAllAnimations()
             let remaining = max(deadline.timeIntervalSinceNow, 0.1)
@@ -749,6 +887,10 @@ final class NotchIsland {
             drain.isRemovedOnCompletion = false
             ringArc.strokeEnd = 0
             ringArc.add(drain, forKey: "drain")
+            ringNumeral.isHidden = true
+            ringTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+                self?.tickRing()
+            }
         }
 
         morph(to: slabPath(centerX: canvasWidth / 2, width: w, height: h), spring: true)
@@ -771,23 +913,56 @@ final class NotchIsland {
         }
     }
 
+    /// Urgency stages: state tint, then amber under 15s, coral plus a numeral
+    /// under 10s.
+    private func tickRing() {
+        guard let deadline = ringDeadline else { return }
+        let remaining = deadline.timeIntervalSinceNow
+        if remaining <= 0 {
+            stopRingTimer()
+            return
+        }
+        let color: NSColor
+        if remaining <= 10 {
+            color = Palette.coral
+            ringNumeral.isHidden = false
+            ringNumeral.stringValue = "\(Int(remaining.rounded(.up)))"
+            ringNumeral.textColor = Palette.coral
+        } else if remaining <= 15 {
+            color = Palette.amber
+            ringNumeral.isHidden = true
+        } else {
+            color = ringTint
+            ringNumeral.isHidden = true
+        }
+        ringArc.strokeColor = color.cgColor
+    }
+
+    private func stopRingTimer() {
+        ringTimer?.invalidate()
+        ringTimer = nil
+        ringDeadline = nil
+        ringNumeral.isHidden = true
+    }
+
+    // MARK: Collapse
+
+    /// Overlapped leave: content fades while the slab eases home. The end
+    /// silhouette equals the notch, so there is nothing left to dissolve.
     private func collapse() {
         expanded = false
+        stopRingTimer()
+        morph(to: collapsedPath(), spring: false)
         NSAnimationContext.runAnimationGroup({ [weak self] ctx in
             ctx.duration = 0.16
             self?.wingView.animator().alphaValue = 0
             self?.trayView.animator().alphaValue = 0
-        }, completionHandler: { [weak self] in
-            guard let self else { return }
-            self.morph(to: self.collapsedPath(), spring: false)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) { [weak self] in
-                guard let self, !self.expanded else { return }
-                self.slab.fillColor = NSColor.clear.cgColor
-                self.slab.strokeColor = NSColor.clear.cgColor
-                self.slab.shadowOpacity = 0
-                self.updateEmber()
-            }
-        })
+        }, completionHandler: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { [weak self] in
+            guard let self, !self.expanded else { return }
+            self.setSlabVisible(false)
+            self.layoutBeads()
+        }
     }
 }
 
@@ -1227,7 +1402,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
         guard !peers.isEmpty else {
             log("📦 No peer connected. Screenshot saved locally at \(url.path)")
             DispatchQueue.main.async {
-                NotchIsland.shared.compact("wifi.slash", NotchIsland.Palette.ash, "No Macs")
+                NotchIsland.shared.compact("wifi.slash", NotchIsland.Palette.ash, "No Macs", kind: .outcome)
             }
             return
         }
@@ -1263,7 +1438,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             self.sendControl(["t": "unhold"])
             log("⌛️ Hold expired. Screenshot saved locally")
             NotchIsland.shared.clearPersist()
-            NotchIsland.shared.compact("hourglass", NotchIsland.Palette.ash, "Expired")
+            NotchIsland.shared.compact("hourglass", NotchIsland.Palette.ash, "Expired", kind: .outcome)
             scheduleWorkDoneSleep()
         }
     }
@@ -1285,7 +1460,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             guard let frame = frameStore.latest(), let myFace = FaceID.faceprint(from: frame) else {
                 log("🙈 No face visible here. Face the camera, then fist and open to catch")
                 DispatchQueue.main.async {
-                    NotchIsland.shared.compact("person.crop.circle.badge.questionmark", NotchIsland.Palette.amber, "Show face")
+                    NotchIsland.shared.compact("person.crop.circle.badge.questionmark", NotchIsland.Palette.amber, "Show face", kind: .prompt, pulsing: true)
                 }
                 return
             }
@@ -1295,7 +1470,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
                     log("🚫 Different person. Normal mode blocks this drop")
                     DispatchQueue.main.async {
                         play("Basso")
-                        NotchIsland.shared.compact("person.crop.circle.badge.xmark", NotchIsland.Palette.coral, "Blocked")
+                        NotchIsland.shared.compact("person.crop.circle.badge.xmark", NotchIsland.Palette.coral, "Blocked", kind: .outcome)
                     }
                     return
                 }
@@ -1324,7 +1499,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             lock.withLock { grabMutedUntil = Date.distantPast }
             log("❌ Catch failed. \(peer.displayName) is unreachable")
             DispatchQueue.main.async {
-                NotchIsland.shared.compact("exclamationmark.triangle.fill", NotchIsland.Palette.coral, "Unreachable")
+                NotchIsland.shared.compact("exclamationmark.triangle.fill", NotchIsland.Palette.coral, "Unreachable", kind: .outcome)
             }
         }
     }
@@ -1353,12 +1528,12 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             if let error {
                 log("❌ Send to \(peer.displayName) failed: \(error.localizedDescription)")
                 DispatchQueue.main.async {
-                    NotchIsland.shared.compact("exclamationmark.triangle.fill", NotchIsland.Palette.coral, "Send failed")
+                    NotchIsland.shared.compact("exclamationmark.triangle.fill", NotchIsland.Palette.coral, "Send failed", kind: .outcome)
                 }
             } else {
                 log("✅ Delivered to \(peer.displayName)")
                 DispatchQueue.main.async {
-                    NotchIsland.shared.compact("checkmark.seal.fill", NotchIsland.Palette.mint, "Sent")
+                    NotchIsland.shared.compact("checkmark.seal.fill", NotchIsland.Palette.mint, "Sent", kind: .outcome)
                     play("Purr")
                 }
                 scheduleWorkDoneSleep()
@@ -1473,7 +1648,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             let why = dict["why"] == "expired" ? "The hold expired" : "Someone else caught it first"
             log("🐢 Too late. \(why)")
             DispatchQueue.main.async {
-                NotchIsland.shared.compact("tortoise.fill", NotchIsland.Palette.coral, "Too late")
+                NotchIsland.shared.compact("tortoise.fill", NotchIsland.Palette.coral, "Too late", kind: .outcome)
             }
         default:
             break
@@ -1549,7 +1724,7 @@ final class StatusUI: NSObject {
         item.button?.title = base + (currentMode == .normal ? " N" : " P")
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "Slingshot v1.6", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Slingshot v1.7", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
 
         menu.addItem(withTitle: "Mode", action: nil, keyEquivalent: "")
@@ -1717,7 +1892,7 @@ final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
 // MARK: - Main
 
-log("Slingshot v1.6. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
+log("Slingshot v1.7. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
 
 // A real NSApplication event loop so Finder/LaunchServices see the app check in.
 // Without this, a double-clicked launch gets flagged "not responding".
@@ -1745,7 +1920,7 @@ func wakeCamera(_ reason: String) {
         log("👁️ Camera awake (\(reason))")
         DispatchQueue.main.async {
             play("Tink")
-            NotchIsland.shared.compact("eye.fill", NotchIsland.Palette.ice, "Awake")
+            NotchIsland.shared.compact("eye.fill", NotchIsland.Palette.ice, "")
             statusUI?.refresh()
         }
     } catch {
@@ -1759,10 +1934,7 @@ func sleepCamera(_ reason: String) {
     cam.stop()
     frameStore.clear()
     log("😴 Camera asleep (\(reason)). Snap to wake")
-    DispatchQueue.main.async {
-        NotchIsland.shared.compact("moon.zzz.fill", NotchIsland.Palette.ash, "Asleep")
-        statusUI?.refresh()
-    }
+    DispatchQueue.main.async { statusUI?.refresh() }
 }
 
 /// Called when a transfer finishes: doze off unless a hand is still around.
@@ -1794,9 +1966,9 @@ func startSnapListening() {
                     if ok {
                         play("Pop")
                         flashScreen()
-                        NotchIsland.shared.compact("doc.on.clipboard.fill", NotchIsland.Palette.mint, "Copied")
+                        NotchIsland.shared.compact("doc.on.clipboard.fill", NotchIsland.Palette.mint, "Copied", kind: .outcome)
                     } else {
-                        NotchIsland.shared.compact("exclamationmark.triangle.fill", NotchIsland.Palette.coral, "Failed")
+                        NotchIsland.shared.compact("exclamationmark.triangle.fill", NotchIsland.Palette.coral, "Failed", kind: .outcome)
                     }
                 }
             }
@@ -1820,7 +1992,7 @@ func startSnapListening() {
                     begin()
                 } else {
                     log("🎤 Microphone denied. Snap features stay off")
-                    NotchIsland.shared.compact("mic.slash.fill", NotchIsland.Palette.ash, "Mic off")
+                    NotchIsland.shared.compact("mic.slash.fill", NotchIsland.Palette.ash, "Mic off", kind: .outcome)
                     if snapWakeEnabled { wakeCamera("microphone denied, always-on fallback") }
                 }
             }
@@ -1837,7 +2009,7 @@ func startEverything() {
     // Screen-recording permission: without it screencapture returns nothing useful.
     if !CGPreflightScreenCaptureAccess() {
         log("⚠️ Screen Recording permission missing. Requesting now. Grant it in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen Slingshot.")
-        NotchIsland.shared.compact("exclamationmark.triangle.fill", NotchIsland.Palette.amber, "No screen access", seconds: 5)
+        NotchIsland.shared.compact("exclamationmark.triangle.fill", NotchIsland.Palette.amber, "No screen access", kind: .outcome, seconds: 5)
         CGRequestScreenCaptureAccess()
     }
 
@@ -1868,7 +2040,7 @@ func startEverything() {
         play("Tink")
         log("👊 Fist seen. Open your hand to drop it here")
         DispatchQueue.main.async {
-            NotchIsland.shared.compact("arrow.down.circle.fill", NotchIsland.Palette.amber, "Open hand")
+            NotchIsland.shared.compact("arrow.down.circle.fill", NotchIsland.Palette.amber, "Open hand", kind: .prompt, pulsing: true)
         }
     }
 
@@ -1905,7 +2077,7 @@ func startEverything() {
             } else {
                 log("❌ Screenshot failed. Check Screen Recording permission")
                 DispatchQueue.main.async {
-                    NotchIsland.shared.compact("exclamationmark.triangle.fill", NotchIsland.Palette.coral, "Failed")
+                    NotchIsland.shared.compact("exclamationmark.triangle.fill", NotchIsland.Palette.coral, "Failed", kind: .outcome)
                 }
             }
         }
@@ -1928,7 +2100,7 @@ func startEverything() {
     if snapWakeEnabled {
         log("😴 Camera starts asleep. Snap your fingers to wake it")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-            NotchIsland.shared.compact("moon.zzz.fill", NotchIsland.Palette.ash, "Snap to wake", seconds: 4)
+            NotchIsland.shared.compact("moon.zzz.fill", NotchIsland.Palette.amber, "Snap to wake", kind: .prompt, pulsing: true, seconds: 4)
         }
     } else {
         wakeCamera("always-on mode")
