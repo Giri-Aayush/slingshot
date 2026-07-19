@@ -1,6 +1,8 @@
 import AVFoundation
 import AppKit
+import CoreImage
 import MultipeerConnectivity
+import SoundAnalysis
 import Vision
 
 // MARK: - Helpers
@@ -49,6 +51,86 @@ func cleanName(_ s: String) -> String {
 struct RuntimeError: Error, CustomStringConvertible {
     let description: String
     init(_ d: String) { description = d }
+}
+
+// MARK: - Transfer modes and face identity
+
+/// Normal: the hold carries the grabber's face print, and the receiving Mac only
+/// completes the drop for a matching face. Best effort, not a security boundary:
+/// the print is a Vision image-similarity embedding, not a face-recognition model.
+/// Pro: anyone at any connected Mac can catch.
+enum TransferMode: String { case normal, pro }
+
+let modeLock = NSLock()
+private var currentModeStorage: TransferMode = .normal
+/// Set from the menu bar, read on the camera and grab queues.
+var currentMode: TransferMode {
+    get { modeLock.withLock { currentModeStorage } }
+    set { modeLock.withLock { currentModeStorage = newValue } }
+}
+
+/// Revision 2 feature-print distances run about 0 (identical) to 2 (unrelated).
+/// Every check logs its distance so this cutoff can be tuned from real data.
+let faceMatchThreshold: Float = 0.55
+
+/// Latest camera frame, shared safely across the camera, grab, and catch threads.
+final class FrameStore {
+    private let lock = NSLock()
+    private var buffer: CVPixelBuffer?
+    func set(_ pb: CVPixelBuffer) { lock.withLock { buffer = pb } }
+    func latest() -> CVPixelBuffer? { lock.withLock { buffer } }
+}
+let frameStore = FrameStore()
+
+/// Face feature-prints for "is this the same person who grabbed?".
+/// Fresh Vision requests per call, so concurrent grab and catch paths share no state.
+enum FaceID {
+    static func faceprint(from pixelBuffer: CVPixelBuffer) -> VNFeaturePrintObservation? {
+        let faceRequest = VNDetectFaceRectanglesRequest()
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up)
+        guard (try? handler.perform([faceRequest])) != nil,
+              let faces = faceRequest.results, !faces.isEmpty else { return nil }
+        let largest = faces.max { a, b in
+            a.boundingBox.width * a.boundingBox.height < b.boundingBox.width * b.boundingBox.height
+        }!
+
+        let ci = CIImage(cvPixelBuffer: pixelBuffer)
+        let w = ci.extent.width
+        let h = ci.extent.height
+        let bb = largest.boundingBox
+        let raw = CGRect(x: bb.minX * w, y: bb.minY * h, width: bb.width * w, height: bb.height * h)
+        let padded = raw.insetBy(dx: -raw.width * 0.15, dy: -raw.height * 0.15)
+        let crop = padded.intersection(ci.extent)
+        guard !crop.isNull, crop.width > 20, crop.height > 20,
+              let cg = CIContext(options: nil).createCGImage(ci, from: crop) else { return nil }
+
+        let fpRequest = VNGenerateImageFeaturePrintRequest()
+        if #available(macOS 14.0, *) {
+            // Pin the revision: the distance scale changes completely between revisions.
+            fpRequest.revision = VNGenerateImageFeaturePrintRequestRevision2
+        }
+        let fpHandler = VNImageRequestHandler(cgImage: cg, orientation: .up)
+        guard (try? fpHandler.perform([fpRequest])) != nil else { return nil }
+        return fpRequest.results?.first as? VNFeaturePrintObservation
+    }
+
+    static func encode(_ obs: VNFeaturePrintObservation) -> String? {
+        guard let data = try? NSKeyedArchiver.archivedData(withRootObject: obs, requiringSecureCoding: true)
+        else { return nil }
+        return data.base64EncodedString()
+    }
+
+    static func decode(_ s: String) -> VNFeaturePrintObservation? {
+        guard let data = Data(base64Encoded: s) else { return nil }
+        return try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: data)
+    }
+
+    /// Smaller is more similar. nil when the prints are incomparable (mixed Vision revisions).
+    static func distance(_ a: VNFeaturePrintObservation, _ b: VNFeaturePrintObservation) -> Float? {
+        var d: Float = 0
+        guard (try? a.computeDistance(&d, to: b)) != nil else { return nil }
+        return d
+    }
 }
 
 // MARK: - Visual effects (all must be called on the main thread)
@@ -748,6 +830,90 @@ func takeScreenshot() -> URL? {
     return FileManager.default.fileExists(atPath: url.path) ? url : nil
 }
 
+/// Full-screen grab straight to the clipboard, paste with Cmd-V. Blocking; call off the main thread.
+@discardableResult
+func copyScreenshotToClipboard() -> Bool {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    p.arguments = ["-c", "-x"]
+    do {
+        try p.run()
+        p.waitUntilExit()
+    } catch {
+        log("❌ screencapture (clipboard) failed to launch: \(error)")
+        return false
+    }
+    return p.terminationStatus == 0
+}
+
+// MARK: - Finger-snap listener
+
+/// Fires onSnap when Apple's on-device sound classifier hears a finger snap.
+/// All analysis is local; no audio leaves the Mac. Debounced so one snap fires once.
+final class SnapListener: NSObject, SNResultsObserving {
+    var onSnap: () -> Void = {}
+    var confidenceThreshold: Double = 0.5
+    var debounce: TimeInterval = 1.2
+
+    private let audio = AVAudioEngine()
+    private var analyzer: SNAudioStreamAnalyzer?
+    private var request: SNClassifySoundRequest?
+    private let queue = DispatchQueue(label: "slingshot.snap")
+    private var lastFire = Date.distantPast
+
+    func start() throws {
+        guard !audio.isRunning else { return }
+        let input = audio.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.channelCount > 0, format.sampleRate > 0 else {
+            throw RuntimeError("Microphone input unavailable")
+        }
+
+        let analyzer = SNAudioStreamAnalyzer(format: format)
+        let request = try SNClassifySoundRequest(classifierIdentifier: .version1)
+        guard request.knownClassifications.contains("finger_snapping") else {
+            throw RuntimeError("Sound classifier has no finger_snapping class")
+        }
+        // High overlap trades a little CPU for catching a snap anywhere in the window.
+        request.overlapFactor = 0.75
+        try analyzer.add(request, withObserver: self)
+        self.analyzer = analyzer
+        self.request = request
+
+        input.installTap(onBus: 0, bufferSize: 8192, format: format) { [weak self] buffer, when in
+            self?.queue.async {
+                self?.analyzer?.analyze(buffer, atAudioFramePosition: when.sampleTime)
+            }
+        }
+        audio.prepare()
+        try audio.start()
+        log("🫰 Listening for finger snaps. A snap copies a screenshot to the clipboard")
+    }
+
+    func stop() {
+        guard audio.isRunning else { return }
+        audio.inputNode.removeTap(onBus: 0)
+        audio.stop()
+        analyzer?.removeAllRequests()
+        analyzer = nil
+        request = nil
+    }
+
+    func request(_ request: SNRequest, didProduce result: SNResult) {
+        guard let result = result as? SNClassificationResult,
+              let snap = result.classification(forIdentifier: "finger_snapping"),
+              snap.confidence >= confidenceThreshold else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastFire) >= debounce else { return }
+        lastFire = now
+        DispatchQueue.main.async { [weak self] in self?.onSnap() }
+    }
+
+    func request(_ request: SNRequest, didFailWithError error: Error) {
+        log("❌ Snap listener failed: \(error.localizedDescription)")
+    }
+}
+
 // MARK: - Peer-to-peer link
 
 final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceBrowserDelegate {
@@ -771,14 +937,20 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
     private var heldFile: URL?
     private var holdGeneration = 0
     private var lastHoldEnd = "caught"
-    private var remoteHolders: [MCPeerID: Date] = [:]
+    struct RemoteHold {
+        let deadline: Date
+        let mode: TransferMode
+        let face: VNFeaturePrintObservation?
+    }
+
+    private var remoteHolders: [MCPeerID: RemoteHold] = [:]
     private var grabMutedUntil = Date.distantPast
 
     var isHolding: Bool { lock.withLock { heldFile != nil } }
     var grabMuted: Bool { lock.withLock { Date() < grabMutedUntil } }
     var hasRemoteHold: Bool {
         let now = Date()
-        return lock.withLock { remoteHolders.values.contains { now < $0 } }
+        return lock.withLock { remoteHolders.values.contains { now < $0.deadline } }
     }
     var nearbyPeers: [MCPeerID] {
         let connected = session.connectedPeers
@@ -827,7 +999,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
     // MARK: Hold / catch protocol
 
     /// Grab: keep the screenshot in the fist. Nothing is sent until a peer catches it.
-    func hold(_ url: URL) {
+    func hold(_ url: URL, mode: TransferMode, ownerFace: String?) {
         let peers = session.connectedPeers
         guard !peers.isEmpty else {
             log("📦 No peer connected. Screenshot saved locally at \(url.path)")
@@ -841,8 +1013,11 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             holdGeneration += 1
             return holdGeneration
         }
-        sendControl(["t": "hold"])
-        log("✊ Holding \(url.lastPathComponent). At the receiving Mac: fist for 1 second, then open your hand. Expires in \(Int(holdWindow)) s")
+        var msg = ["t": "hold", "mode": mode.rawValue]
+        if let ownerFace { msg["face"] = ownerFace }
+        sendControl(msg)
+        let lockNote = (mode == .normal && ownerFace != nil) ? " Locked to your face." : ""
+        log("✊ Holding \(url.lastPathComponent).\(lockNote) At the receiving Mac: fist for 1 second, then open your hand. Expires in \(Int(holdWindow)) s")
         DispatchQueue.main.async {
             NotchIsland.shared.holdState("square.and.arrow.up.fill", NotchIsland.Palette.ice,
                                          "Holding. Drop at another Mac: fist, then open hand",
@@ -865,26 +1040,60 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
     }
 
     /// A deliberate fist-then-open at this Mac's camera: catch the freshest live hold.
+    /// Normal-mode holds carry the grabber's face print; the catch only completes when
+    /// this Mac's camera sees a matching face. Best effort, not a security boundary.
     func catchGesture() {
         let connected = session.connectedPeers
-        let holder: MCPeerID? = lock.withLock {
-            let now = Date()
-            remoteHolders = remoteHolders.filter { now < $0.value && connected.contains($0.key) }
-            guard let best = remoteHolders.max(by: { $0.value < $1.value })?.key else { return nil }
-            remoteHolders[best] = nil
-            grabMutedUntil = Date().addingTimeInterval(postCatchMute)
-            return best
+        let now = Date()
+        // Peek without consuming: face verification is slow and must run outside the lock.
+        let candidate: (peer: MCPeerID, hold: RemoteHold)? = lock.withLock {
+            remoteHolders = remoteHolders.filter { now < $0.value.deadline && connected.contains($0.key) }
+            return remoteHolders.max(by: { $0.value.deadline < $1.value.deadline }).map { ($0.key, $0.value) }
         }
-        guard let holder else { return }
-        log("🫳 Catch! Requesting the screenshot from \(holder.displayName)")
+        guard let (peer, hold) = candidate else { return }
+
+        if hold.mode == .normal, let ownerFace = hold.face {
+            guard let frame = frameStore.latest(), let myFace = FaceID.faceprint(from: frame) else {
+                log("🙈 No face visible here. Face the camera, then fist and open to catch")
+                DispatchQueue.main.async {
+                    NotchIsland.shared.pulse("person.crop.circle.badge.questionmark", NotchIsland.Palette.amber, "Face the camera to catch this")
+                }
+                return
+            }
+            if let dist = FaceID.distance(ownerFace, myFace) {
+                log(String(format: "   · face distance %.3f (match if at most %.2f)", dist, faceMatchThreshold))
+                if dist > faceMatchThreshold {
+                    log("🚫 Different person. Normal mode blocks this drop")
+                    DispatchQueue.main.async {
+                        play("Basso")
+                        NotchIsland.shared.pulse("person.crop.circle.badge.xmark", NotchIsland.Palette.coral, "Only the person who grabbed can catch this")
+                    }
+                    return
+                }
+                log("✅ Face matches the grabber")
+            } else {
+                // Prints from different Vision revisions are incomparable (mixed macOS
+                // versions). Let the transfer through rather than dead-ending it, and say so.
+                log("⚠️ Face prints incomparable across these Macs. Allowing the catch")
+            }
+        }
+
+        let claimed: Bool = lock.withLock {
+            guard remoteHolders[peer] != nil else { return false }
+            remoteHolders[peer] = nil
+            grabMutedUntil = Date().addingTimeInterval(postCatchMute)
+            return true
+        }
+        guard claimed else { return }
+        log("🫳 Catch! Requesting the screenshot from \(peer.displayName)")
         DispatchQueue.main.async {
             play("Tink")
             NotchIsland.shared.clearPersist()
             NotchIsland.shared.pulse("arrow.down.circle.fill", NotchIsland.Palette.mint, "Catching…")
         }
-        if !sendControl(["t": "catch"], to: [holder]) {
+        if !sendControl(["t": "catch"], to: [peer]) {
             lock.withLock { grabMutedUntil = Date.distantPast }
-            log("❌ Catch failed. \(holder.displayName) is unreachable")
+            log("❌ Catch failed. \(peer.displayName) is unreachable")
             DispatchQueue.main.async {
                 NotchIsland.shared.pulse("exclamationmark.triangle.fill", NotchIsland.Palette.coral, "Catch failed. The holding Mac is unreachable")
             }
@@ -970,7 +1179,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             let anyLeft: Bool = lock.withLock {
                 remoteHolders[id] = nil
                 let now = Date()
-                return remoteHolders.values.contains { now < $0 }
+                return remoteHolders.values.contains { now < $0.deadline }
             }
             DispatchQueue.main.async {
                 if !anyLeft { NotchIsland.shared.clearPersist() }
@@ -986,7 +1195,13 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
               let type = dict["t"] else { return }
         switch type {
         case "hold":
-            lock.withLock { remoteHolders[id] = Date().addingTimeInterval(holdWindow + 2) }
+            // Peers that predate modes send no mode field; treat them as unlocked.
+            let mode = TransferMode(rawValue: dict["mode"] ?? "pro") ?? .pro
+            let face = dict["face"].flatMap(FaceID.decode)
+            lock.withLock {
+                remoteHolders[id] = RemoteHold(deadline: Date().addingTimeInterval(holdWindow + 2),
+                                               mode: mode, face: face)
+            }
             log("🫴 \(id.displayName) is holding a screenshot. Hold a fist for 1 second, then open your hand to catch it here")
             DispatchQueue.main.async {
                 play("Tink")
@@ -998,7 +1213,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             let anyLeft: Bool = lock.withLock {
                 remoteHolders[id] = nil
                 let now = Date()
-                return remoteHolders.values.contains { now < $0 }
+                return remoteHolders.values.contains { now < $0.deadline }
             }
             if !anyLeft {
                 DispatchQueue.main.async { NotchIsland.shared.clearPersist() }
@@ -1090,10 +1305,28 @@ final class StatusUI: NSObject {
         let connected = link.session.connectedPeers.sorted { $0.displayName < $1.displayName }
         let nearby = link.nearbyPeers
         NotchIsland.shared.setPresence(connected.count)
-        item.button?.title = connected.isEmpty ? "✊…" : "✊ \(connected.count)"
+        let base = connected.isEmpty ? "✊…" : "✊ \(connected.count)"
+        item.button?.title = base + (currentMode == .normal ? " N" : " P")
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "Slingshot v1.0", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Slingshot v1.1", action: nil, keyEquivalent: "")
+        menu.addItem(.separator())
+
+        menu.addItem(withTitle: "Mode", action: nil, keyEquivalent: "")
+        let normalItem = NSMenuItem(title: "Normal: face match required to catch", action: #selector(setNormal), keyEquivalent: "")
+        normalItem.target = self
+        normalItem.state = (currentMode == .normal) ? .on : .off
+        menu.addItem(normalItem)
+        let proItem = NSMenuItem(title: "Pro: anyone can catch", action: #selector(setPro), keyEquivalent: "")
+        proItem.target = self
+        proItem.state = (currentMode == .pro) ? .on : .off
+        menu.addItem(proItem)
+        menu.addItem(.separator())
+
+        let snapItem = NSMenuItem(title: "Snap fingers for a clipboard screenshot", action: #selector(toggleSnap), keyEquivalent: "")
+        snapItem.target = self
+        snapItem.state = snapToClipboardEnabled ? .on : .off
+        menu.addItem(snapItem)
         menu.addItem(.separator())
         if connected.isEmpty && nearby.isEmpty {
             menu.addItem(withTitle: "Searching for nearby Macs…", action: nil, keyEquivalent: "")
@@ -1120,6 +1353,32 @@ final class StatusUI: NSObject {
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit Slingshot", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
+    }
+
+    @objc private func setNormal() {
+        currentMode = .normal
+        log("🔒 Mode: Normal. Only the person who grabs can catch")
+        refresh()
+    }
+
+    @objc private func setPro() {
+        currentMode = .pro
+        log("🔗 Mode: Pro. Anyone at any connected Mac can catch")
+        refresh()
+    }
+
+    @objc private func toggleSnap() {
+        snapToClipboardEnabled.toggle()
+        UserDefaults.standard.set(snapToClipboardEnabled, forKey: "snapToClipboard")
+        if snapToClipboardEnabled {
+            log("🫰 Snap-to-clipboard on")
+            startSnapListening()
+        } else {
+            log("🔇 Snap-to-clipboard off")
+            snapListener?.stop()
+            snapListener = nil
+        }
+        refresh()
     }
 
     @objc private func openFolder() {
@@ -1174,7 +1433,7 @@ final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
 // MARK: - Main
 
-log("Slingshot v1.0. Palm, then fist, and your screen flies to the nearest Mac")
+log("Slingshot v1.1. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
 
 // A real NSApplication event loop so Finder/LaunchServices see the app check in.
 // Without this, a double-clicked launch gets flagged "not responding".
@@ -1187,6 +1446,58 @@ let handRequest = VNDetectHumanHandPoseRequest()
 handRequest.maximumHandCount = 1
 var camera: Camera?
 var statusUI: StatusUI?
+var snapListener: SnapListener?
+var snapToClipboardEnabled = UserDefaults.standard.bool(forKey: "snapToClipboard")  // opt-in, persisted
+
+/// Bring up the snap listener if the user turned it on. Requests microphone access
+/// on first use; denial leaves the camera features untouched.
+func startSnapListening() {
+    guard snapToClipboardEnabled, snapListener == nil else { return }
+
+    let begin = {
+        let listener = SnapListener()
+        listener.onSnap = {
+            log("🫰 Snap! Copying a screenshot to the clipboard…")
+            DispatchQueue.global(qos: .userInitiated).async {
+                let ok = copyScreenshotToClipboard()
+                DispatchQueue.main.async {
+                    if ok {
+                        play("Pop")
+                        flashScreen()
+                        NotchIsland.shared.pulse("doc.on.clipboard.fill", NotchIsland.Palette.mint, "Screenshot copied. Press Cmd-V to paste")
+                    } else {
+                        NotchIsland.shared.pulse("exclamationmark.triangle.fill", NotchIsland.Palette.coral, "Screenshot failed. Check Screen Recording permission")
+                    }
+                }
+            }
+        }
+        do {
+            try listener.start()
+            snapListener = listener
+        } catch {
+            log("❌ Snap listener did not start: \(error)")
+        }
+    }
+
+    switch AVCaptureDevice.authorizationStatus(for: .audio) {
+    case .authorized:
+        begin()
+    case .notDetermined:
+        log("… Waiting for microphone approval (snap-to-clipboard)")
+        AVCaptureDevice.requestAccess(for: .audio) { ok in
+            DispatchQueue.main.async {
+                if ok {
+                    begin()
+                } else {
+                    log("🎤 Microphone denied. Snap-to-clipboard stays off")
+                    NotchIsland.shared.pulse("mic.slash.fill", NotchIsland.Palette.ash, "Enable Microphone to snap for screenshots")
+                }
+            }
+        }
+    default:
+        log("🎤 Microphone denied. Enable Slingshot in System Settings, Privacy and Security, Microphone")
+    }
+}
 
 func startEverything() {
     statusUI = StatusUI()
@@ -1249,7 +1560,17 @@ func startEverything() {
                         animateGrab(image: img)
                     }
                 }
-                link.hold(shot)
+                var ownerFace: String?
+                if currentMode == .normal {
+                    if let frame = frameStore.latest(), let fp = FaceID.faceprint(from: frame),
+                       let encoded = FaceID.encode(fp) {
+                        ownerFace = encoded
+                        log("🙂 Face captured. This grab is locked to you")
+                    } else {
+                        log("⚠️ No face visible at grab time. Sending without a face lock")
+                    }
+                }
+                link.hold(shot, mode: currentMode, ownerFace: ownerFace)
             } else {
                 log("❌ Screenshot failed. Check Screen Recording permission")
                 DispatchQueue.main.async {
@@ -1260,6 +1581,7 @@ func startEverything() {
     }
 
     let cam = Camera { pixelBuffer in
+        frameStore.set(pixelBuffer)
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up)
         guard (try? handler.perform([handRequest])) != nil else { return }
         if let obs = handRequest.results?.first {
@@ -1280,6 +1602,8 @@ func startEverything() {
     }
 
     log("🙌 Ready. Hold your palm open and still for 2 seconds, then hold your fist for 1 second to grab.")
+
+    startSnapListening()
 }
 
 switch AVCaptureDevice.authorizationStatus(for: .video) {
