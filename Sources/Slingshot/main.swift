@@ -238,6 +238,40 @@ func animateReceive(image: NSImage, then completion: @escaping () -> Void) {
 /// morphs between silhouettes with a real spring. The flared-top shape is the
 /// boring.notch family look, implemented independently. At rest nothing draws
 /// except the ember heartbeat when peers are connected.
+/// An invisible window covering exactly the physical notch. The notch is dead
+/// pixels, so it can accept mouse hover and file drops without stealing a
+/// single click from real UI.
+private final class NotchSensorView: NSView {
+    var onEnter: () -> Void = {}
+    var onExit: () -> Void = {}
+    var onDragEnter: () -> Void = {}
+    var onDrop: (URL) -> Void = { _ in }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds,
+                                       options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { onEnter() }
+    override func mouseExited(with event: NSEvent) { onExit() }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        onDragEnter()
+        return .copy
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) { onExit() }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let url = NSURL(from: sender.draggingPasteboard) as URL? else { return false }
+        onDrop(url)
+        return true
+    }
+}
+
 final class NotchIsland {
     static let shared = NotchIsland()
 
@@ -280,6 +314,14 @@ final class NotchIsland {
     private var persistentFace: Face?
     private var connectedCount = 0
     private var expanded = false
+    private var hovering = false
+    private var sensorWindow: NSWindow?
+    private let sensorView = NotchSensorView()
+
+    /// Supplies the hover tray's content. Set by the app layer.
+    var statusProvider: () -> (title: String, subtitle: String) = { ("Slingshot", "") }
+    /// A file was dropped on the notch. Set by the app layer.
+    var onDropFile: (URL) -> Void = { _ in }
 
     private let trayBand: CGFloat = 64
     private let canvasWidth: CGFloat = 800
@@ -393,11 +435,38 @@ final class NotchIsland {
         ringTrack.strokeColor = NSColor.white.withAlphaComponent(0.14).cgColor
         trayView.addSubview(ringView)
 
+        sensorView.registerForDraggedTypes([.fileURL])
+        sensorView.onEnter = { [weak self] in self?.hoverPeek() }
+        sensorView.onExit = { [weak self] in self?.hoverEnd() }
+        sensorView.onDragEnter = { [weak self] in
+            self?.collapseWork?.cancel()
+            self?.show(.tray(image: nil, symbol: "plus.circle.fill", tint: Palette.ice,
+                             title: "Drop to hold",
+                             subtitle: "Release, then fist and open at another Mac",
+                             deadline: nil, total: 0))
+        }
+        sensorView.onDrop = { [weak self] url in self?.onDropFile(url) }
+
         reanchor()
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in
             self?.reanchor()
         }
+    }
+
+    /// Hover over the notch: peek at status, unless a hold is already showing.
+    private func hoverPeek() {
+        hovering = true
+        guard persistentFace == nil else { return }
+        collapseWork?.cancel()
+        let status = statusProvider()
+        show(.tray(image: nil, symbol: "hand.raised.fill", tint: Palette.ice,
+                   title: status.title, subtitle: status.subtitle, deadline: nil, total: 0))
+    }
+
+    private func hoverEnd() {
+        hovering = false
+        scheduleSettle(after: 0.3)
     }
 
     /// Pin the fixed canvas over the current notch (or top-center, notchless).
@@ -424,6 +493,28 @@ final class NotchIsland {
         window.setFrame(frame, display: true)
         window.orderFront(nil)
         slab.frame = canvas.bounds
+
+        if hasNotch {
+            let notchFrame = NSRect(x: screen.frame.midX - notchWidth / 2,
+                                    y: screen.frame.maxY - notchHeight,
+                                    width: notchWidth, height: notchHeight)
+            if sensorWindow == nil {
+                let w = NSWindow(contentRect: notchFrame, styleMask: .borderless, backing: .buffered, defer: false)
+                w.isOpaque = false
+                w.backgroundColor = .clear
+                w.hasShadow = false
+                w.ignoresMouseEvents = false
+                w.isReleasedWhenClosed = false
+                w.level = .statusBar
+                w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+                w.contentView = sensorView
+                sensorWindow = w
+            }
+            sensorWindow?.setFrame(notchFrame, display: true)
+            sensorWindow?.orderFront(nil)
+        } else {
+            sensorWindow?.orderOut(nil)
+        }
         if !expanded {
             slab.path = collapsedPath()
         } else if let face = persistentFace {
@@ -1151,8 +1242,11 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
         let lockNote = (mode == .normal && ownerFace != nil) ? " Locked to your face." : ""
         log("✊ Holding \(url.lastPathComponent).\(lockNote) At the receiving Mac: fist for 1 second, then open your hand. Expires in \(Int(holdWindow)) s")
         DispatchQueue.main.async {
-            NotchIsland.shared.tray(image: NSImage(contentsOf: url), symbol: "square.and.arrow.up.fill",
-                                    tint: NotchIsland.Palette.ice, title: "Holding screenshot",
+            let isShot = url.path.hasPrefix(shotsDir.path)
+            let thumb = NSImage(contentsOf: url) ?? NSWorkspace.shared.icon(forFile: url.path)
+            NotchIsland.shared.tray(image: thumb, symbol: "square.and.arrow.up.fill",
+                                    tint: NotchIsland.Palette.ice,
+                                    title: isShot ? "Holding screenshot" : "Holding \(url.lastPathComponent)",
                                     subtitle: "Fist 1 second, then open your hand at another Mac",
                                     deadline: Date().addingTimeInterval(self.holdWindow), total: self.holdWindow,
                                     persist: true)
@@ -1455,7 +1549,7 @@ final class StatusUI: NSObject {
         item.button?.title = base + (currentMode == .normal ? " N" : " P")
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "Slingshot v1.5", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Slingshot v1.6", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
 
         menu.addItem(withTitle: "Mode", action: nil, keyEquivalent: "")
@@ -1623,7 +1717,7 @@ final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
 // MARK: - Main
 
-log("Slingshot v1.5. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
+log("Slingshot v1.6. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
 
 // A real NSApplication event loop so Finder/LaunchServices see the app check in.
 // Without this, a double-clicked launch gets flagged "not responding".
@@ -1845,6 +1939,21 @@ func startEverything() {
         guard snapWakeEnabled, let cam = camera, cam.isRunning else { return }
         if Date().timeIntervalSince(frameStore.lastHand()) > 30 {
             sleepCamera("idle")
+        }
+    }
+
+    NotchIsland.shared.statusProvider = {
+        let peers = link.session.connectedPeers
+        let title = peers.isEmpty ? "No Macs connected" : "\(peers.count) Mac\(peers.count == 1 ? "" : "s") connected"
+        let cam = (camera?.isRunning ?? false) ? "Camera awake" : "Camera asleep, snap to wake"
+        let mode = currentMode == .normal ? "Normal mode" : "Pro mode"
+        return (title, "\(cam) · \(mode)")
+    }
+
+    NotchIsland.shared.onDropFile = { url in
+        log("🪂 Dropped \(url.lastPathComponent) onto the notch. Holding it")
+        DispatchQueue.global(qos: .userInitiated).async {
+            link.hold(url, mode: currentMode, ownerFace: nil)
         }
     }
 
