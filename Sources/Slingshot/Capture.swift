@@ -1,5 +1,7 @@
 import AppKit
+import AudioToolbox
 import AVFoundation
+import SlingshotCore
 import SoundAnalysis
 
 // MARK: - Screenshot
@@ -48,25 +50,58 @@ func copyScreenshotToClipboard() -> Bool {
     return p.terminationStatus == 0
 }
 
-// MARK: - Finger-snap listener
+// MARK: - Finger-snap and clap listener
 
-/// Fires onSnap when Apple's on-device sound classifier hears a finger snap.
-/// All analysis is local; no audio leaves the Mac. Debounced so one snap fires once.
+/// Fires onSnap when Apple's on-device sound classifier hears a finger snap,
+/// onClap when it hears a clap. All analysis is local; no audio leaves the Mac.
+/// One shared debounce covers both: a snap and a clap are near-identical
+/// transients, so routeSoundWindow picks a single winner per window.
 final class SnapListener: NSObject, SNResultsObserving {
     var onSnap: () -> Void = {}
     var onClap: () -> Void = {}
-    var confidenceThreshold: Double = 0.5
+    /// Whether each action currently has a consumer; see routeSoundWindow.
+    var snapActionEnabled: () -> Bool = { true }
+    var clapActionEnabled: () -> Bool = { true }
     var debounce: TimeInterval = 1.2
+    var debugLogging = true
 
     private let audio = AVAudioEngine()
     private var analyzer: SNAudioStreamAnalyzer?
     private let queue = DispatchQueue(label: "slingshot.snap")
     private var lastFire = Date.distantPast
+    private var tapBeats = 0
 
     func start() throws {
         guard !audio.isRunning else { return }
         let input = audio.inputNode
-        let format = input.outputFormat(forBus: 0)
+
+        // Pin the built-in mic ONLY when something else holds the default-input
+        // role (a Bluetooth speaker's far-field mic hears no claps). When the
+        // default already is the built-in mic, leave the engine untouched;
+        // pinning under AVAudioEngine can leave its render chain silent.
+        var pinned = false
+        if let builtIn = builtInInputDeviceID(), defaultInputDeviceID() != builtIn,
+           let unit = input.audioUnit {
+            var device = builtIn
+            let err = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                                           kAudioUnitScope_Global, 0, &device,
+                                           UInt32(MemoryLayout<AudioDeviceID>.size))
+            var applied = AudioDeviceID(0)
+            var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+            AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                                 kAudioUnitScope_Global, 0, &applied, &size)
+            pinned = err == noErr && applied == builtIn
+            if pinned {
+                log("🎙️ Pinned the built-in microphone (default input was elsewhere)")
+            } else {
+                log("⚠️ Could not pin the built-in microphone (err \(err)). Using the system input")
+            }
+        }
+
+        // Unpinned, the tap sees the node's client-side format, the stock path.
+        // Pinned, the node's cached client format can describe the OLD device
+        // (an uncatchable installTap exception), so use the hardware format.
+        let format = pinned ? input.inputFormat(forBus: 0) : input.outputFormat(forBus: 0)
         guard format.channelCount > 0, format.sampleRate > 0 else {
             throw RuntimeError("Microphone input unavailable")
         }
@@ -76,6 +111,10 @@ final class SnapListener: NSObject, SNResultsObserving {
         guard request.knownClassifications.contains("finger_snapping") else {
             throw RuntimeError("Sound classifier has no finger_snapping class")
         }
+        if !request.knownClassifications.contains("clapping") {
+            // Snaps still work; claps just will not fire on this classifier.
+            log("⚠️ Sound classifier has no clapping class. Clap features unavailable")
+        }
         // High overlap trades a little CPU for catching a snap anywhere in the window.
         request.overlapFactor = 0.75
         try analyzer.add(request, withObserver: self)
@@ -83,13 +122,26 @@ final class SnapListener: NSObject, SNResultsObserving {
 
         input.installTap(onBus: 0, bufferSize: 8192, format: format) { [weak self] buffer, when in
             self?.queue.async {
-                self?.analyzer?.analyze(buffer, atAudioFramePosition: when.sampleTime)
+                guard let self else { return }
+                // Heartbeat: proves audio is actually flowing, with rough level.
+                self.tapBeats += 1
+                if self.debugLogging, self.tapBeats % 30 == 1 {
+                    var level: Float = 0
+                    if let data = buffer.floatChannelData?[0], buffer.frameLength > 0 {
+                        var sum: Float = 0
+                        let n = Int(buffer.frameLength)
+                        for i in stride(from: 0, to: n, by: 16) { sum += abs(data[i]) }
+                        level = sum / Float((n + 15) / 16)
+                    }
+                    log(String(format: "   · mic heartbeat #%d level %.4f", self.tapBeats, level))
+                }
+                self.analyzer?.analyze(buffer, atAudioFramePosition: when.sampleTime)
             }
         }
         audio.prepare()
         try audio.start()
-        let action = snapToClipboardEnabled ? "copies a screenshot to the clipboard" : "wakes the camera"
-        log("🫰 Listening. A snap \(action); a clap puts the camera to sleep")
+        let clapAction = clapMuteEnabled ? "mutes or unmutes the Mac" : "puts the camera to sleep"
+        log("🫰 Listening for finger snaps and claps. A clap \(clapAction)")
     }
 
     func stop() {
@@ -102,17 +154,24 @@ final class SnapListener: NSObject, SNResultsObserving {
 
     func request(_ request: SNRequest, didProduce result: SNResult) {
         guard let result = result as? SNClassificationResult else { return }
-        let snap = result.classification(forIdentifier: "finger_snapping")?.confidence ?? 0
-        let clap = result.classification(forIdentifier: "clapping")?.confidence ?? 0
-        guard max(snap, clap) >= confidenceThreshold else { return }
+        let snapConfidence = result.classification(forIdentifier: "finger_snapping")?.confidence ?? 0
+        // Room acoustics smear a single clap across "clapping" and "applause".
+        let clapConfidence = max(result.classification(forIdentifier: "clapping")?.confidence ?? 0,
+                                 result.classification(forIdentifier: "applause")?.confidence ?? 0)
+        guard let trigger = routeSoundWindow(snapConfidence: snapConfidence,
+                                             clapConfidence: clapConfidence,
+                                             snapEnabled: snapActionEnabled(),
+                                             clapEnabled: clapActionEnabled()) else { return }
         let now = Date()
         // One debounce for both sounds, so a snap's tail can never read as a clap.
         guard now.timeIntervalSince(lastFire) >= debounce else { return }
         lastFire = now
-        if snap >= clap {
-            DispatchQueue.main.async { [weak self] in self?.onSnap() }
-        } else {
-            DispatchQueue.main.async { [weak self] in self?.onClap() }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            switch trigger {
+            case .snap: self.onSnap()
+            case .clap: self.onClap()
+            }
         }
     }
 

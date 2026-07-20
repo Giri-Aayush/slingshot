@@ -5,7 +5,7 @@ import Vision
 
 // MARK: - Main
 
-log("Slingshot v2.2. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
+log("Slingshot v2.3. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
 
 // A real NSApplication event loop so Finder/LaunchServices see the app check in.
 // Without this, a double-clicked launch gets flagged "not responding".
@@ -29,6 +29,10 @@ var snapWakeEnabled: Bool = {
     // Default on: the camera sleeps until a snap wakes it.
     UserDefaults.standard.object(forKey: "snapWake") == nil || UserDefaults.standard.bool(forKey: "snapWake")
 }()
+
+var clapMuteEnabled = UserDefaults.standard.bool(forKey: "clapMute")  // opt-in, persisted
+/// Serial queue for mute toggles: back-to-back claps must apply in order.
+let muteQueue = DispatchQueue(label: "slingshot.mute")
 
 let cameraControlQueue = DispatchQueue(label: "slingshot.camera.control")
 
@@ -69,17 +73,95 @@ func scheduleWorkDoneSleep() {
     }
 }
 
-/// Bring up the snap listener if the user turned it on. Requests microphone access
-/// on first use; denial leaves the camera features untouched.
+// MARK: - Feature switches (shared setters, one stop predicate)
+
+func stopSoundListenerIfUnused() {
+    if !snapWakeEnabled && !snapToClipboardEnabled && !clapMuteEnabled {
+        snapListener?.stop()
+        snapListener = nil
+        snapWakeOperational = false
+    }
+}
+
+func setSnapWake(_ on: Bool) {
+    snapWakeEnabled = on
+    UserDefaults.standard.set(on, forKey: "snapWake")
+    if on {
+        log("🫰 Snap-to-wake on. The camera sleeps when idle")
+        startSnapListening()
+        scheduleWorkDoneSleep()
+    } else {
+        log("👁️ Camera always on")
+        wakeCamera("always-on mode")
+        stopSoundListenerIfUnused()
+    }
+    statusUI?.refresh()
+}
+
+func setSnapClipboard(_ on: Bool) {
+    snapToClipboardEnabled = on
+    UserDefaults.standard.set(on, forKey: "snapToClipboard")
+    if on {
+        log("🫰 Snap-to-clipboard on")
+        startSnapListening()
+    } else {
+        log("🔇 Snap-to-clipboard off")
+        stopSoundListenerIfUnused()
+    }
+    statusUI?.refresh()
+}
+
+func setClapMute(_ on: Bool) {
+    clapMuteEnabled = on
+    UserDefaults.standard.set(on, forKey: "clapMute")
+    if on {
+        log("👏 Clap-to-mute on")
+        startSnapListening()
+    } else {
+        log("🔇 Clap-to-mute off. A clap puts the camera to sleep again")
+        stopSoundListenerIfUnused()
+    }
+    statusUI?.refresh()
+}
+
+/// Bring up the snap/clap listener if any sound feature is on. Requests
+/// microphone access on first use; denial leaves the camera features untouched.
 func startSnapListening() {
-    guard snapWakeEnabled || snapToClipboardEnabled, snapListener == nil else { return }
+    guard snapWakeEnabled || snapToClipboardEnabled || clapMuteEnabled, snapListener == nil else { return }
 
     let begin = {
+        // Re-check: the mic prompt takes arbitrarily long, and the user may have
+        // toggled features (or another call may have begun a listener) meanwhile.
+        guard snapListener == nil, snapWakeEnabled || snapToClipboardEnabled || clapMuteEnabled else { return }
         let listener = SnapListener()
+        listener.snapActionEnabled = { snapWakeEnabled || snapToClipboardEnabled }
+        // A clap always has a consumer: sleep the camera (default) or toggle mute.
+        listener.clapActionEnabled = { true }
         listener.onClap = {
-            guard let cam = camera, cam.isRunning else { return }
-            log("👏 Clap. Putting the camera to sleep")
-            sleepCamera("clap")
+            // Default: the mirror of snap-to-wake, a clap puts the camera to
+            // sleep. Opted in, the clap toggles the Mac's output mute instead.
+            guard clapMuteEnabled else {
+                guard let cam = camera, cam.isRunning else { return }
+                log("👏 Clap. Putting the camera to sleep")
+                sleepCamera("clap")
+                return
+            }
+            muteQueue.async {
+                guard let nowMuted = toggleSystemOutputMute() else {
+                    log("❌ Clap heard, but the output device refused the mute toggle")
+                    DispatchQueue.main.async {
+                        NotchIsland.shared.compact("exclamationmark.triangle.fill", NotchIsland.Palette.coral, "Mute failed", kind: .outcome)
+                    }
+                    return
+                }
+                log(nowMuted ? "👏 Clap! System sound muted" : "👏 Clap! System sound back on")
+                DispatchQueue.main.async {
+                    if !nowMuted { play("Pop") }  // a mute confirmation would be inaudible
+                    NotchIsland.shared.compact(nowMuted ? "speaker.slash.fill" : "speaker.wave.2.fill",
+                                               nowMuted ? NotchIsland.Palette.ash : NotchIsland.Palette.mint,
+                                               nowMuted ? "Muted" : "Sound on", kind: .outcome)
+                }
+            }
         }
         listener.onSnap = {
             if snapWakeEnabled, let cam = camera, !cam.isRunning {
