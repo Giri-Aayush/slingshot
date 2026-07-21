@@ -1,4 +1,6 @@
 import AppKit
+import SlingshotCore
+import SlingshotUI
 import MultipeerConnectivity
 import Vision
 

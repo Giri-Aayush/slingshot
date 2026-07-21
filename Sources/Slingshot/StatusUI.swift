@@ -1,4 +1,6 @@
 import AppKit
+import SlingshotCore
+import SlingshotUI
 import ServiceManagement
 import Sparkle
 
@@ -21,7 +23,7 @@ final class StatusUI: NSObject {
         item.button?.title = base + (currentMode == .normal ? " N" : " P")
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "Slingshot v2.3", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Slingshot v2.3.1", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
 
         menu.addItem(withTitle: "Mode", action: nil, keyEquivalent: "")

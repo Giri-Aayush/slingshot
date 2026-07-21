@@ -6,3 +6,4 @@ Slingshot.app/
 Slingshot.zip
 *.png
 .DS_Store
+snapshots/

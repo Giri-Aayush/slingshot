@@ -2,9 +2,9 @@ import AppKit
 
 // MARK: - Helpers
 
-let logFileURL = FileManager.default.homeDirectoryForCurrentUser
+public let logFileURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Logs/Slingshot.log")
-let shotsDir = FileManager.default.homeDirectoryForCurrentUser
+public let shotsDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Pictures/Slingshot", isDirectory: true)
 
 let logQueue = DispatchQueue(label: "slingshot.log")
@@ -29,7 +29,7 @@ let logHandle: FileHandle? = {
     return handle
 }()
 
-func log(_ msg: String) {
+public func log(_ msg: String) {
     let now = Date()
     logQueue.async {
         let line = "[\(logFormatter.string(from: now))] \(msg)\n"
@@ -41,13 +41,13 @@ func log(_ msg: String) {
     }
 }
 
-func play(_ name: String) {
+public func play(_ name: String) {
     NSSound(named: NSSound.Name(name))?.play()
 }
 
 /// Stable per-install identity used for peer trust; peer display names carry a
 /// random suffix each launch, so trust must key on something durable.
-let installID: String = {
+public let installID: String = {
     let defaults = UserDefaults.standard
     if let id = defaults.string(forKey: "installID") { return id }
     let id = UUID().uuidString
@@ -55,12 +55,12 @@ let installID: String = {
     return id
 }()
 
-func cleanName(_ s: String) -> String {
+public func cleanName(_ s: String) -> String {
     s.components(separatedBy: "#").first ?? s
 }
 
-struct RuntimeError: Error, CustomStringConvertible {
-    let description: String
-    init(_ d: String) { description = d }
+public struct RuntimeError: Error, CustomStringConvertible {
+    public let description: String
+    public init(_ d: String) { description = d }
 }
 

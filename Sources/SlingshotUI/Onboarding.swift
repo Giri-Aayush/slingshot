@@ -1,13 +1,14 @@
 import AppKit
 import AVFoundation
+import SlingshotCore
 
 /// First-run welcome, implementing the design specification: fixed 560x748,
 /// reserved bands so no state ever collides, a miniature island as the hero,
 /// permission cards whose glyph well is the status lamp, gesture storyboard
 /// panels with ambient teaching, and a Done that brightens when the work is
 /// finished but never holds anyone hostage.
-final class OnboardingWindow: NSObject {
-    static let shared = OnboardingWindow()
+public final class OnboardingWindow: NSObject {
+    public static let shared = OnboardingWindow()
 
     private enum Spec {
         static let width: CGFloat = 560
@@ -27,6 +28,8 @@ final class OnboardingWindow: NSObject {
     private var pollTimer: Timer?
     private var idleTimer: Timer?
     private var onDone: () -> Void = {}
+    /// Runs after Done when the camera is granted; the app wires this to wake it.
+    public var onHandoff: () -> Void = {}
     private var cards: [PermissionCard] = []
     private var statusLine: NSTextField?
     private var doneButton: FlatButton?
@@ -109,7 +112,7 @@ final class OnboardingWindow: NSObject {
 
     // MARK: Presentation
 
-    func showIfNeeded(completion: @escaping () -> Void) {
+    public func showIfNeeded(completion: @escaping () -> Void) {
         guard !UserDefaults.standard.bool(forKey: "onboarded") else {
             completion()
             return
@@ -118,13 +121,25 @@ final class OnboardingWindow: NSObject {
         show()
     }
 
-    func show() {
+    public func show() {
         if let window {
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
             return
         }
         present()
+    }
+
+    /// The complete laid-out content view, for geometry tests and snapshots.
+    public func _testContentView() -> NSView {
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: Spec.width, height: Spec.height))
+        content.wantsLayer = true
+        buildHero(in: content)
+        buildCards(in: content)
+        buildGesturePanels(in: content)
+        buildFooter(in: content)
+        for view in content.subviews { view.alphaValue = 1 }
+        return content
     }
 
     private func present() {
@@ -833,7 +848,7 @@ final class OnboardingWindow: NSObject {
                 // The handoff is the last lesson.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                     if AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
-                        wakeCamera("welcome done")
+                        self.onHandoff()
                     }
                 }
                 self.onDone()

@@ -1,4 +1,6 @@
+import SlingshotCore
 import AppKit
+import SlingshotUI
 import Sparkle
 
 // Sparkle checks the appcast in the repo and installs signed updates.

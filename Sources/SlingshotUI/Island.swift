@@ -1,4 +1,5 @@
 import AppKit
+import SlingshotCore
 
 // MARK: - Notch island
 
@@ -47,12 +48,12 @@ private final class NotchSensorView: NSView {
     }
 }
 
-enum IslandClass: Int {
+public enum IslandClass: Int {
     case status = 1   // Armed, Connected, Catching, awake eye, hover peek
     case prompt = 2   // Open hand, Show face, Snap to wake, Drop to hold
     case outcome = 3  // Sent, Copied, Received, Blocked, Too late, Expired, failures
 
-    var dwell: TimeInterval {
+    public var dwell: TimeInterval {
         switch self {
         case .status: return 1.8
         case .prompt: return 2.6
@@ -61,15 +62,15 @@ enum IslandClass: Int {
     }
 }
 
-final class NotchIsland {
-    static let shared = NotchIsland()
+public final class NotchIsland {
+    public static let shared = NotchIsland()
 
-    enum Palette {
-        static let amber = NSColor(calibratedRed: 1.00, green: 0.72, blue: 0.20, alpha: 1)
-        static let ice   = NSColor(calibratedRed: 0.35, green: 0.85, blue: 1.00, alpha: 1)
-        static let mint  = NSColor(calibratedRed: 0.30, green: 0.90, blue: 0.55, alpha: 1)
-        static let coral = NSColor(calibratedRed: 1.00, green: 0.42, blue: 0.38, alpha: 1)
-        static let ash   = NSColor(white: 0.78, alpha: 1)
+    public enum Palette {
+        public static let amber = NSColor(calibratedRed: 1.00, green: 0.72, blue: 0.20, alpha: 1)
+        public static let ice   = NSColor(calibratedRed: 0.35, green: 0.85, blue: 1.00, alpha: 1)
+        public static let mint  = NSColor(calibratedRed: 0.30, green: 0.90, blue: 0.55, alpha: 1)
+        public static let coral = NSColor(calibratedRed: 1.00, green: 0.42, blue: 0.38, alpha: 1)
+        public static let ash   = NSColor(white: 0.78, alpha: 1)
     }
 
     private enum Face {
@@ -127,9 +128,9 @@ final class NotchIsland {
     private let sensorView = NotchSensorView()
 
     /// Supplies the hover tray's content. Set by the app layer.
-    var statusProvider: () -> (title: String, subtitle: String) = { ("Slingshot", "") }
+    public var statusProvider: () -> (title: String, subtitle: String) = { ("Slingshot", "") }
     /// A file was dropped on the notch. Set by the app layer.
-    var onDropFile: (URL) -> Void = { _ in }
+    public var onDropFile: (URL) -> Void = { _ in }
 
     private let trayBand: CGFloat = 80
     private let trayWidth: CGFloat = 380
@@ -212,6 +213,7 @@ final class NotchIsland {
         wingView.addSubview(wingIcon)
         wingView.addSubview(wingLabel)
         canvas.addSubview(wingView)
+        canvas.addSubview(trayView)
 
         // Tray panel
         trayView.alphaValue = 0
@@ -433,7 +435,7 @@ final class NotchIsland {
     // MARK: Public API
 
     /// Quick event in the wings. Status by default; prompts pulse their glyph.
-    func compact(_ symbol: String?, _ tint: NSColor, _ word: String,
+    public func compact(_ symbol: String?, _ tint: NSColor, _ word: String,
                  kind: IslandClass = .status, pulsing: Bool = false, seconds: TimeInterval? = nil) {
         let dwell = seconds ?? kind.dwell
         guard beginTransient(kind, for: dwell) else { return }
@@ -442,7 +444,7 @@ final class NotchIsland {
     }
 
     /// Standing hold or rich moment below the notch. Always trayWidth wide.
-    func tray(image: NSImage?, symbol: String?, tint: NSColor, title: String, subtitle: String,
+    public func tray(image: NSImage?, symbol: String?, tint: NSColor, title: String, subtitle: String,
               deadline: Date?, total: TimeInterval, persist: Bool,
               kind: IslandClass = .outcome, seconds: TimeInterval = 4.5) {
         let face = Face.tray(image: image, symbol: symbol, tint: tint,
@@ -463,7 +465,7 @@ final class NotchIsland {
         }
     }
 
-    func clearPersist() {
+    public func clearPersist() {
         persistentFace = nil
         // Respect a dwelling transient; settle() collapses after it.
         guard Date() >= transientUntil else { return }
@@ -473,7 +475,7 @@ final class NotchIsland {
 
     /// A live transfer: the tray ring becomes a progress ring. Persists until
     /// endTransfer() or clearPersist().
-    func transferTray(image: NSImage?, symbol: String?, tint: NSColor,
+    public func transferTray(image: NSImage?, symbol: String?, tint: NSColor,
                       title: String, subtitle: String, progress: Progress) {
         let face = Face.progressTray(image: image, symbol: symbol, tint: tint,
                                      title: title, subtitle: subtitle, progress: progress)
@@ -484,13 +486,13 @@ final class NotchIsland {
 
     /// The transfer ended; drop the standing face without collapsing, so an
     /// outcome pulse can take over cleanly.
-    func endTransfer() {
+    public func endTransfer() {
         progressObservation?.invalidate()
         progressObservation = nil
         persistentFace = nil
     }
 
-    func setPresence(_ connected: Int) {
+    public func setPresence(_ connected: Int) {
         connectedCount = connected
         layoutBeads()
     }
@@ -807,4 +809,44 @@ final class NotchIsland {
     }
 }
 
+// MARK: - Test seams
 
+public struct IslandTestSnapshot {
+    public let canvasBounds: CGRect
+    public let slabBounds: CGRect
+    public let notchBand: CGRect
+    public let wingContentFrames: [CGRect]
+    public let trayContentFrames: [CGRect]
+    public let beadPositions: [CGPoint]
+}
+
+extension NotchIsland {
+    /// Current geometry in canvas coordinates, for layout-invariant tests.
+    public func _testSnapshot() -> IslandTestSnapshot {
+        let band = CGRect(x: canvasWidth / 2 - notchWidth / 2, y: slabTop - notchHeight,
+                          width: notchWidth, height: notchHeight)
+        func inCanvas(_ view: NSView) -> CGRect? {
+            guard !view.isHidden, var ancestor = view.superview else { return nil }
+            var rect = view.frame
+            while ancestor !== canvas {
+                rect.origin.x += ancestor.frame.origin.x
+                rect.origin.y += ancestor.frame.origin.y
+                guard let up = ancestor.superview else { return nil }
+                ancestor = up
+            }
+            return rect
+        }
+        let wingFrames = [wingIcon as NSView, wingLabel].compactMap(inCanvas).filter { $0.width > 0.5 }
+        let trayFrames = [trayThumb as NSView, trayWell, trayTitle, traySub, ringView]
+            .compactMap(inCanvas).filter { $0.width > 0.5 }
+        return IslandTestSnapshot(canvasBounds: canvas.bounds,
+                                  slabBounds: slab.path?.boundingBox ?? .zero,
+                                  notchBand: band,
+                                  wingContentFrames: wingFrames,
+                                  trayContentFrames: trayFrames,
+                                  beadPositions: beads.map { $0.position })
+    }
+
+    /// The canvas view, for offscreen snapshot rendering.
+    public func _testCanvas() -> NSView { canvas }
+}

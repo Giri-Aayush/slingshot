@@ -1,3 +1,4 @@
+import SlingshotCore
 import AppKit
 import CoreImage
 import Vision

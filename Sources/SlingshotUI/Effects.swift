@@ -1,8 +1,9 @@
 import AppKit
+import SlingshotCore
 
 // MARK: - Visual effects (all must be called on the main thread)
 
-func flashScreen() {
+public func flashScreen() {
     guard let screen = NSScreen.main else { return }
     let w = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
     w.level = .screenSaver
@@ -39,7 +40,7 @@ private func makeImageWindow(image: NSImage, frame: NSRect) -> NSWindow {
 }
 
 /// The screenshot appears large, then shrinks toward the bottom-right corner, like it was grabbed off the screen.
-func animateGrab(image: NSImage) {
+public func animateGrab(image: NSImage) {
     guard let screen = NSScreen.main else { return }
     let sf = screen.visibleFrame
     let aspect = image.size.height / max(image.size.width, 1)
@@ -59,7 +60,7 @@ func animateGrab(image: NSImage) {
 }
 
 /// A received screenshot zooms up into the center of the screen, holds, then fades and hands off.
-func animateReceive(image: NSImage, then completion: @escaping () -> Void) {
+public func animateReceive(image: NSImage, then completion: @escaping () -> Void) {
     guard let screen = NSScreen.main else { completion(); return }
     let sf = screen.visibleFrame
     let aspect = image.size.height / max(image.size.width, 1)

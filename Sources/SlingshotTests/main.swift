@@ -1,8 +1,10 @@
 // Dependency-free test runner for SlingshotCore. Runs everywhere the
 // toolchain does, no Xcode required: swift run SlingshotTests
+import AppKit
 import CoreGraphics
 import Foundation
 import SlingshotCore
+import SlingshotUI
 
 var failures = 0
 
@@ -147,6 +149,102 @@ do {
     let route = routeSoundWindow(snapConfidence: 0.1, clapConfidence: 0.4,
                                  snapEnabled: true, clapEnabled: true)
     expect(route == .clap, "clapLowerBar", "clap 0.4 is over the 0.35 clap bar and should fire")
+}
+
+// MARK: - UI geometry invariants
+// These reproduce the exact bug classes we shipped and caught by eye:
+// overlapping footer controls, content clipped by bands, and island content
+// drawn inside the physical notch where no pixels exist.
+
+if NSScreen.screens.isEmpty {
+    print("SKIP  UI geometry (no display attached)")
+} else {
+    _ = NSApplication.shared
+
+    func within(_ inner: CGRect, _ outer: CGRect, tolerance: CGFloat = 0.5) -> Bool {
+        outer.insetBy(dx: -tolerance, dy: -tolerance).contains(inner)
+    }
+    func disjoint(_ a: CGRect, _ b: CGRect, tolerance: CGFloat = 0.5) -> Bool {
+        !a.insetBy(dx: tolerance, dy: tolerance).intersects(b.insetBy(dx: tolerance, dy: tolerance))
+    }
+
+    // Island: compact face keeps its content on the wings, never in the notch
+    let island = NotchIsland.shared
+    island.compact("hand.raised.fill", NotchIsland.Palette.amber, "Armed", kind: .status, seconds: 0.05)
+    var snap = island._testSnapshot()
+    expect(!snap.wingContentFrames.isEmpty, "compactHasContent", "a compact face should lay out wing content")
+    for frame in snap.wingContentFrames {
+        expect(within(frame, snap.slabBounds), "wingInsideSlab", "wing content must sit inside the slab silhouette")
+        expect(disjoint(frame, snap.notchBand), "wingClearOfNotch", "wing content must never enter the physical notch band")
+    }
+
+    // Let the compact transient expire so the persistent tray may display
+    Thread.sleep(forTimeInterval: 0.1)
+
+    // Island: a tray with a long peer name stays inside the slab, below the notch
+    island.tray(image: nil, symbol: "tray.and.arrow.down.fill", tint: NotchIsland.Palette.mint,
+                title: "Adityas MacBook Air with an unreasonably long machine name is holding",
+                subtitle: "Fist 1 second, then open your hand to catch",
+                deadline: Date().addingTimeInterval(30), total: 30, persist: true)
+    snap = island._testSnapshot()
+    expect(!snap.trayContentFrames.isEmpty, "trayHasContent", "a tray face should lay out tray content")
+    for frame in snap.trayContentFrames {
+        expect(within(frame, snap.slabBounds), "trayInsideSlab", "tray content must sit inside the slab silhouette; frame \(frame) slab \(snap.slabBounds)")
+        expect(frame.maxY <= snap.notchBand.minY + 0.5, "trayBelowNotch", "tray content must render below the notch band")
+    }
+    for (i, a) in snap.trayContentFrames.enumerated() {
+        for b in snap.trayContentFrames[(i + 1)...] {
+            expect(disjoint(a, b), "trayContentDisjoint", "tray elements must never overlap each other")
+        }
+    }
+    island.clearPersist()
+
+    // Island: peer beads sit on live pixels below the notch, one per peer
+    island.setPresence(3)
+    snap = island._testSnapshot()
+    expect(snap.beadPositions.count == 3, "beadPerPeer", "three peers should show three beads")
+    for bead in snap.beadPositions {
+        expect(bead.y < snap.notchBand.minY, "beadBelowNotch",
+               "beads must render below the notch band, where pixels exist")
+    }
+    island.setPresence(0)
+
+    // Welcome window: every top-level element inside the window, none overlapping
+    let content = OnboardingWindow.shared._testContentView()
+    let elements = content.subviews.filter { !$0.isHidden }
+    expect(elements.count >= 12, "welcomeBuilt", "the welcome window should lay out its full band structure")
+    for view in elements {
+        expect(within(view.frame, content.bounds), "welcomeInBounds",
+               "\(type(of: view)) at \(view.frame) must stay inside the window")
+    }
+    for (i, a) in elements.enumerated() {
+        for b in elements[(i + 1)...] {
+            expect(disjoint(a.frame, b.frame), "welcomeNoOverlap",
+                   "\(type(of: a)) \(a.frame) and \(type(of: b)) \(b.frame) must not overlap")
+        }
+    }
+
+    // Snapshot gallery: render the states we just asserted, best effort
+    let snapshotsDir = URL(fileURLWithPath: "snapshots", isDirectory: true)
+    try? FileManager.default.createDirectory(at: snapshotsDir, withIntermediateDirectories: true)
+    func writePNG(_ view: NSView, _ name: String) {
+        let stage = NSWindow(contentRect: NSRect(x: -20000, y: -20000,
+                                                 width: view.frame.width, height: view.frame.height),
+                             styleMask: .borderless, backing: .buffered, defer: false)
+        stage.contentView = view
+        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+        view.cacheDisplay(in: view.bounds, to: rep)
+        if let data = rep.representation(using: .png, properties: [:]) {
+            try? data.write(to: snapshotsDir.appendingPathComponent(name))
+        }
+        stage.contentView = nil
+    }
+    writePNG(OnboardingWindow.shared._testContentView(), "welcome.png")
+    island.tray(image: nil, symbol: "square.and.arrow.up.fill", tint: NotchIsland.Palette.ice,
+                title: "Holding screenshot", subtitle: "Fist 1 second, then open your hand at another Mac",
+                deadline: Date().addingTimeInterval(30), total: 30, persist: true)
+    print("NOTE  snapshots written to snapshots/ (welcome.png)")
+    island.clearPersist()
 }
 
 if failures > 0 {
