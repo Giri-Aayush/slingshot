@@ -30,9 +30,10 @@ Things we consider security issues:
   recorded or transmitted.
 - Screenshots and dropped files are sent only to the peer that completes the
   catch gesture, over MultipeerConnectivity with encryption required.
-- In Normal mode, a face feature print travels with a hold to session peers
-  and is discarded when the hold ends. It is an image-similarity embedding,
-  not a face-recognition identity, and is documented as best effort.
+- In Normal mode, up to three face feature prints and a per-hold acceptance
+  threshold travel with a hold to session peers and are discarded when the
+  hold ends. The prints are image-similarity embeddings, not face-recognition
+  identities, and the check is documented as best effort.
 - There is no telemetry, no analytics, and no server.
 
 ## Known limitations

@@ -20,11 +20,12 @@ clipboard. They leave the Mac only when a peer completes the catch gesture.
 with encryption required, on your local network. Nothing is relayed through
 any third party.
 
-**Face data.** In Normal mode, a hold carries a Vision feature print of the
-grabber's face so the receiving Mac can check the catcher. It is sent
-encrypted to session peers and discarded when the hold ends. It is an
-image-similarity embedding, not a biometric identity template, and the check
-is documented as best effort rather than a security boundary.
+**Face data.** In Normal mode, a hold carries up to three Vision feature
+prints of the grabber's face, sampled over about a second at grab time, so
+the receiving Mac can check the catcher. They are sent encrypted to session
+peers and discarded when the hold ends. They are image-similarity embeddings,
+not biometric identity templates, and the check is documented as best effort
+rather than a security boundary.
 
 **Local records.** The app writes a log of its own activity to
 ~/Library/Logs/Slingshot.log and stores your preferences in UserDefaults.

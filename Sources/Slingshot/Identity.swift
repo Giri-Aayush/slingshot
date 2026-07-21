@@ -19,9 +19,10 @@ var currentMode: TransferMode {
     set { modeLock.withLock { currentModeStorage = newValue } }
 }
 
-/// Revision 2 feature-print distances run about 0 (identical) to 2 (unrelated).
-/// Every check logs its distance so this cutoff can be tuned from real data.
-let faceMatchThreshold: Float = 0.55
+// The acceptance threshold is no longer a constant here. Each hold calibrates
+// its own: see enroll() below and FaceLock.swift in SlingshotCore. The old
+// 0.55 constant survives only as legacyFaceThreshold for holds from peers
+// that sent a single print.
 
 /// Latest camera frame, shared safely across the camera, grab, and catch threads.
 final class FrameStore {
@@ -39,14 +40,29 @@ let frameStore = FrameStore()
 /// Face feature-prints for "is this the same person who grabbed?".
 /// Fresh Vision requests per call, so concurrent grab and catch paths share no state.
 enum FaceID {
-    static func faceprint(from pixelBuffer: CVPixelBuffer) -> VNFeaturePrintObservation? {
-        let faceRequest = VNDetectFaceRectanglesRequest()
+    /// One face print plus Apple's capture-quality score for the frame it came
+    /// from (0 worst to 1 best, comparable only on the same Mac).
+    struct Sample {
+        let print: VNFeaturePrintObservation
+        let quality: Float
+    }
+
+    /// Frames whose best face scores below this are junk (motion blur, half a
+    /// face at the frame edge) and are not worth printing.
+    private static let minQuality: Float = 0.1
+
+    static func sample(from pixelBuffer: CVPixelBuffer) -> Sample? {
+        // Capture quality detection also returns the bounding boxes, so one
+        // request gives us both the crop and a way to rank frames.
+        let faceRequest = VNDetectFaceCaptureQualityRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up)
         guard (try? handler.perform([faceRequest])) != nil,
               let faces = faceRequest.results, !faces.isEmpty else { return nil }
         let largest = faces.max { a, b in
             a.boundingBox.width * a.boundingBox.height < b.boundingBox.width * b.boundingBox.height
         }!
+        let quality = largest.faceCaptureQuality ?? 0
+        guard quality >= minQuality else { return nil }
 
         let ci = CIImage(cvPixelBuffer: pixelBuffer)
         let w = ci.extent.width
@@ -64,8 +80,80 @@ enum FaceID {
             fpRequest.revision = VNGenerateImageFeaturePrintRequestRevision2
         }
         let fpHandler = VNImageRequestHandler(cgImage: cg, orientation: .up)
-        guard (try? fpHandler.perform([fpRequest])) != nil else { return nil }
-        return fpRequest.results?.first as? VNFeaturePrintObservation
+        guard (try? fpHandler.perform([fpRequest])) != nil,
+              let print = fpRequest.results?.first as? VNFeaturePrintObservation else { return nil }
+        return Sample(print: print, quality: quality)
+    }
+
+    struct Enrollment {
+        let prints: [VNFeaturePrintObservation]
+        let threshold: Float
+    }
+
+    /// Grab-time enrollment: sample the grabber's face across several frames,
+    /// keep the best few by capture quality, and measure how much the SAME face
+    /// on the SAME camera varies between them. That measured spread, not a
+    /// constant, sets the acceptance threshold that travels with the hold.
+    /// Blocking; call off the camera queue so frames keep flowing underneath.
+    static func enroll(frames: () -> CVPixelBuffer?,
+                       samples: Int = 4, interval: TimeInterval = 0.25) -> Enrollment? {
+        var collected: [Sample] = []
+        for i in 0..<samples {
+            if let frame = frames(), let s = sample(from: frame) {
+                collected.append(s)
+            }
+            if i < samples - 1 { Thread.sleep(forTimeInterval: interval) }
+        }
+        guard !collected.isEmpty else { return nil }
+        let best = Array(collected.sorted { $0.quality > $1.quality }.prefix(3))
+
+        var intra: [Float] = []
+        for i in 0..<best.count {
+            for j in (i + 1)..<best.count {
+                if let d = distance(best[i].print, best[j].print) { intra.append(d) }
+            }
+        }
+        let threshold = faceLockThreshold(intraDistances: intra)
+        let spread = intra.max() ?? 0
+        log(String(format: "🙂 Face enrolled: %d prints, quality %.2f best, spread %.3f, threshold %.2f",
+                   best.count, best.first?.quality ?? 0, spread, threshold))
+        return Enrollment(prints: best.map { $0.print }, threshold: threshold)
+    }
+
+    enum Verdict {
+        case matched(Float)
+        case blocked(Float)
+        case noFace
+        case incomparable
+    }
+
+    /// Catch-time check: give the catcher several looks over about a second and
+    /// a half instead of judging one frame. A sample matches when its distance
+    /// to ANY enrolled print clears the hold's own threshold; one good look is
+    /// enough. Blocking; call off the camera queue.
+    static func verify(enrolled: [VNFeaturePrintObservation], threshold: Float,
+                       frames: () -> CVPixelBuffer?,
+                       attempts: Int = 5, interval: TimeInterval = 0.3) -> Verdict {
+        var sawFace = false
+        var comparableSeen = false
+        var best = Float.greatestFiniteMagnitude
+        for i in 0..<attempts {
+            if let frame = frames(), let s = sample(from: frame) {
+                sawFace = true
+                let ds = enrolled.compactMap { distance($0, s.print) }
+                if let d = ds.min() {
+                    comparableSeen = true
+                    best = min(best, d)
+                    if faceLockAccepts(candidateDistances: [d], threshold: threshold) {
+                        return .matched(d)
+                    }
+                }
+            }
+            if i < attempts - 1 { Thread.sleep(forTimeInterval: interval) }
+        }
+        guard sawFace else { return .noFace }
+        guard comparableSeen else { return .incomparable }
+        return .blocked(best)
     }
 
     static func encode(_ obs: VNFeaturePrintObservation) -> String? {

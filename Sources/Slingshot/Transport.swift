@@ -33,10 +33,12 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
     struct RemoteHold {
         let deadline: Date
         let mode: TransferMode
-        let face: VNFeaturePrintObservation?
+        let faces: [VNFeaturePrintObservation]
+        let faceThreshold: Float
     }
 
     private var remoteHolders: [MCPeerID: RemoteHold] = [:]
+    private var faceCheckActive = false
     private var grabMutedUntil = Date.distantPast
     private var transfersActive = 0
 
@@ -146,7 +148,9 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
     // MARK: Hold / catch protocol
 
     /// Grab: keep the screenshot in the fist. Nothing is sent until a peer catches it.
-    func hold(_ url: URL, mode: TransferMode, ownerFace: String?) {
+    /// faceLock carries the grabber's enrolled prints and the threshold their own
+    /// enrollment calibrated; both travel with the hold.
+    func hold(_ url: URL, mode: TransferMode, faceLock: (prints: [String], threshold: Float)?) {
         let peers = session.connectedPeers
         guard !peers.isEmpty else {
             log("📦 No peer connected. Screenshot saved locally at \(url.path)")
@@ -161,9 +165,15 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             return holdGeneration
         }
         var msg = ["t": "hold", "mode": mode.rawValue]
-        if let ownerFace { msg["face"] = ownerFace }
+        if let faceLock, !faceLock.prints.isEmpty {
+            // Base64 never contains "|", so it is a safe join for the string-only
+            // control channel. "face" keeps pre-2.5 receivers working.
+            msg["faces"] = faceLock.prints.joined(separator: "|")
+            msg["fth"] = String(faceLock.threshold)
+            msg["face"] = faceLock.prints[0]
+        }
         sendControl(msg)
-        let lockNote = (mode == .normal && ownerFace != nil) ? " Locked to your face." : ""
+        let lockNote = (mode == .normal && faceLock != nil) ? " Locked to your face." : ""
         log("✊ Holding \(url.lastPathComponent).\(lockNote) At the receiving Mac: fist for 1 second, then open your hand. Expires in \(Int(holdWindow)) s")
         DispatchQueue.main.async {
             let isShot = url.path.hasPrefix(shotsDir.path)
@@ -205,32 +215,59 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
         }
         guard let (peer, hold) = candidate else { return }
 
-        if hold.mode == .normal, let ownerFace = hold.face {
-            guard let frame = frameStore.latest(), let myFace = FaceID.faceprint(from: frame) else {
-                log("🙈 No face visible here. Face the camera, then fist and open to catch")
-                DispatchQueue.main.async {
-                    NotchIsland.shared.compact("person.crop.circle.badge.questionmark", NotchIsland.Palette.amber, "Show face", kind: .prompt, pulsing: true)
-                }
-                return
+        if hold.mode == .normal, !hold.faces.isEmpty {
+            // The check samples frames for over a second, and this runs on the
+            // camera queue. Blocking here would freeze the very frames the check
+            // needs, so it moves to a utility queue; one check at a time.
+            let start: Bool = lock.withLock {
+                guard !faceCheckActive else { return false }
+                faceCheckActive = true
+                return true
             }
-            if let dist = FaceID.distance(ownerFace, myFace) {
-                log(String(format: "   · face distance %.3f (match if at most %.2f)", dist, faceMatchThreshold))
-                if dist > faceMatchThreshold {
-                    log("🚫 Different person. Normal mode blocks this drop")
+            guard start else { return }
+            log("🪪 Checking your face against the grabber's enrollment…")
+            DispatchQueue.main.async {
+                NotchIsland.shared.compact("person.crop.circle", NotchIsland.Palette.ice, "Face check")
+            }
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self else { return }
+                let verdict = FaceID.verify(enrolled: hold.faces, threshold: hold.faceThreshold,
+                                            frames: { frameStore.latest() })
+                self.lock.withLock { self.faceCheckActive = false }
+                switch verdict {
+                case .matched(let dist):
+                    log(String(format: "✅ Face matches the grabber (distance %.3f, threshold %.2f)",
+                               dist, hold.faceThreshold))
+                    self.claimAndCatch(peer)
+                case .incomparable:
+                    // Prints from different Vision revisions are incomparable (mixed
+                    // macOS versions). Let the transfer through rather than dead-ending
+                    // it, and say so.
+                    log("⚠️ Face prints incomparable across these Macs. Allowing the catch")
+                    self.claimAndCatch(peer)
+                case .noFace:
+                    log("🙈 No face visible here. Face the camera, then fist and open to catch")
+                    DispatchQueue.main.async {
+                        NotchIsland.shared.compact("person.crop.circle.badge.questionmark", NotchIsland.Palette.amber, "Show face", kind: .prompt, pulsing: true)
+                    }
+                case .blocked(let dist):
+                    log(String(format: "🚫 Different person. Best distance %.3f, needed at most %.2f. Normal mode blocks this drop",
+                               dist, hold.faceThreshold))
                     DispatchQueue.main.async {
                         play("Basso")
                         NotchIsland.shared.compact("person.crop.circle.badge.xmark", NotchIsland.Palette.coral, "Blocked", kind: .outcome)
                     }
-                    return
                 }
-                log("✅ Face matches the grabber")
-            } else {
-                // Prints from different Vision revisions are incomparable (mixed macOS
-                // versions). Let the transfer through rather than dead-ending it, and say so.
-                log("⚠️ Face prints incomparable across these Macs. Allowing the catch")
             }
+            return
         }
+        claimAndCatch(peer)
+    }
 
+    /// Consume the hold and request the file. Safe to call after a slow face
+    /// check: if the hold expired or was caught elsewhere meanwhile, the claim
+    /// simply fails and nothing is sent.
+    private func claimAndCatch(_ peer: MCPeerID) {
         let claimed: Bool = lock.withLock {
             guard remoteHolders[peer] != nil else { return false }
             remoteHolders[peer] = nil
@@ -426,10 +463,15 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
         case "hold":
             // Peers that predate modes send no mode field; treat them as unlocked.
             let mode = TransferMode(rawValue: dict["mode"] ?? "pro") ?? .pro
-            let face = dict["face"].flatMap(FaceID.decode)
+            // 2.5+ senders enroll several prints and calibrate their own threshold.
+            // Older senders send one print and no threshold; the legacy constant covers them.
+            let encodedFaces = dict["faces"].map { $0.split(separator: "|").map(String.init) }
+                ?? dict["face"].map { [$0] } ?? []
+            let faces = encodedFaces.compactMap(FaceID.decode)
+            let threshold = dict["fth"].flatMap(Float.init) ?? legacyFaceThreshold
             lock.withLock {
                 remoteHolders[id] = RemoteHold(deadline: Date().addingTimeInterval(holdWindow + 2),
-                                               mode: mode, face: face)
+                                               mode: mode, faces: faces, faceThreshold: threshold)
             }
             DispatchQueue.main.async { wakeCamera("incoming hold") }
             log("🫴 \(id.displayName) is holding a screenshot. Hold a fist for 1 second, then open your hand to catch it here")

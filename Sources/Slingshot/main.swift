@@ -281,17 +281,19 @@ func startEverything() {
                         animateGrab(image: img)
                     }
                 }
-                var ownerFace: String?
+                var faceLock: (prints: [String], threshold: Float)?
                 if currentMode == .normal {
-                    if let frame = frameStore.latest(), let fp = FaceID.faceprint(from: frame),
-                       let encoded = FaceID.encode(fp) {
-                        ownerFace = encoded
-                        log("🙂 Face captured. This grab is locked to you")
-                    } else {
+                    // Samples about a second of frames; we are already off the
+                    // camera queue, so fresh frames keep arriving underneath.
+                    if let enrollment = FaceID.enroll(frames: { frameStore.latest() }) {
+                        let encoded = enrollment.prints.compactMap(FaceID.encode)
+                        if !encoded.isEmpty { faceLock = (encoded, enrollment.threshold) }
+                    }
+                    if faceLock == nil {
                         log("⚠️ No face visible at grab time. Sending without a face lock")
                     }
                 }
-                link.hold(shot, mode: currentMode, ownerFace: ownerFace)
+                link.hold(shot, mode: currentMode, faceLock: faceLock)
             } else {
                 log("❌ Screenshot failed. Check Screen Recording permission")
                 DispatchQueue.main.async {
@@ -344,7 +346,7 @@ func startEverything() {
         guard requirePro("Dropping files on the notch") else { return }
         log("🪂 Dropped \(url.lastPathComponent) onto the notch. Holding it")
         DispatchQueue.global(qos: .userInitiated).async {
-            link.hold(url, mode: currentMode, ownerFace: nil)
+            link.hold(url, mode: currentMode, faceLock: nil)
         }
     }
 

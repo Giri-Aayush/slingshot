@@ -183,6 +183,29 @@ do {
            "licenseWrongKeyFails", "a key signed by another authority must not validate")
 }
 
+// MARK: - Face lock policy
+// The threshold is calibrated per hold from the grabber's own enrollment
+// spread; these pin the math down so a Vision change or a refactor cannot
+// silently loosen or dead-end the lock.
+do {
+    expect(faceLockThreshold(intraDistances: []) == legacyFaceThreshold,
+           "faceThresholdFallback", "no calibration data must fall back to the legacy constant")
+    expect(faceLockThreshold(intraDistances: [0.02, 0.03]) == faceThresholdFloor,
+           "faceThresholdFloor", "a near-zero spread must not produce an uncatchable threshold")
+    expect(abs(faceLockThreshold(intraDistances: [0.2]) - 0.6) < 0.001,
+           "faceThresholdScales", "spread 0.2 should give 0.2 x 2.5 + 0.1 = 0.6")
+    expect(faceLockThreshold(intraDistances: [1.5]) == faceThresholdCeiling,
+           "faceThresholdCeiling", "a huge spread must clamp, never accept everyone")
+    expect(faceLockThreshold(intraDistances: [0.1]) <= faceLockThreshold(intraDistances: [0.25]),
+           "faceThresholdMonotonic", "a wider measured spread must never tighten the threshold")
+    expect(faceLockAccepts(candidateDistances: [0.9, 0.4], threshold: 0.5),
+           "faceAcceptsBestSample", "one good look among several must be enough")
+    expect(!faceLockAccepts(candidateDistances: [0.8, 0.7], threshold: 0.5),
+           "faceRejectsAllFar", "every sample over the threshold must block")
+    expect(!faceLockAccepts(candidateDistances: [], threshold: 0.5),
+           "faceRejectsNoSamples", "no comparable samples must not accept")
+}
+
 // MARK: - UI geometry invariants
 // These reproduce the exact bug classes we shipped and caught by eye:
 // overlapping footer controls, content clipped by bands, and island content
