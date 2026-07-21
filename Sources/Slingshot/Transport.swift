@@ -39,6 +39,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
 
     private var remoteHolders: [MCPeerID: RemoteHold] = [:]
     private var faceCheckActive = false
+    private var roomPitchShown = false
     private var grabMutedUntil = Date.distantPast
     private var transfersActive = 0
 
@@ -84,6 +85,9 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
 
     private func retryInvites() {
         let connected = session.connectedPeers
+        // The retry loop must respect the free-tier room cap too, or it would
+        // quietly invite a trusted third Mac every 8 seconds.
+        guard isPro() || connected.isEmpty else { return }
         let candidates = lock.withLock {
             discovered.filter { trustedIDs.contains($0.value) && !connected.contains($0.key) && shouldInvite($0.key) }
                 .map { $0.key }
@@ -92,6 +96,26 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             log("🔁 Retrying connection to \(id.displayName)…")
             invite(id)
         }
+    }
+
+    /// Free-tier room cap: two Macs. Returns true when this new peer does not
+    /// fit, pitching Pro the first time it happens instead of failing silently.
+    /// Activating a key reopens the room; the retry loop picks trusted Macs up
+    /// within seconds.
+    private func roomFull(for name: String) -> Bool {
+        guard !isPro(), !session.connectedPeers.isEmpty else { return false }
+        let pitch: Bool = lock.withLock {
+            guard !roomPitchShown else { return false }
+            roomPitchShown = true
+            return true
+        }
+        if pitch {
+            log("🔒 \(name) is nearby, but the free room holds two Macs")
+            requirePro("A room with three or more Macs")
+        } else {
+            log("🔒 \(name) does not fit the free two Mac room")
+        }
+        return true
     }
 
     // MARK: Trust
@@ -351,10 +375,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
         let iid = info?["iid"] ?? "legacy:" + cleanName(id.displayName)
         lock.withLock { discovered[id] = iid }
         DispatchQueue.main.async { statusUI?.refresh() }
-        if !isPro() && !session.connectedPeers.isEmpty {
-            log("🔒 A second peer needs Slingshot Pro. Staying a two Mac room")
-            return
-        }
+        if roomFull(for: cleanName(id.displayName)) { return }
         switch trustStatus(of: iid) {
         case "trusted":
             if shouldInvite(id) { invite(id) }
@@ -392,8 +413,7 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
         } else {
             iid = "legacy:" + cleanName(id.displayName)
         }
-        if !isPro() && !session.connectedPeers.isEmpty {
-            log("🔒 A second peer needs Slingshot Pro. Declining \(id.displayName)")
+        if roomFull(for: cleanName(id.displayName)) {
             invitationHandler(false, nil)
             return
         }

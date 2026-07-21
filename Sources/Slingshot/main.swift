@@ -343,6 +343,17 @@ func startEverything() {
     }
 
     NotchIsland.shared.onDropFile = { url in
+        // MultipeerConnectivity's sendResource cannot carry a directory, and
+        // app bundles are directories too. Say so instead of failing mid-air.
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+            log("🚫 \(url.lastPathComponent) is a folder. Slingshot carries single files; compress it and drop the zip")
+            DispatchQueue.main.async {
+                play("Basso")
+                NotchIsland.shared.compact("folder.badge.minus", NotchIsland.Palette.coral, "Files only", kind: .outcome)
+            }
+            return
+        }
         guard requirePro("Dropping files on the notch") else { return }
         log("🪂 Dropped \(url.lastPathComponent) onto the notch. Holding it")
         DispatchQueue.global(qos: .userInitiated).async {
