@@ -68,6 +68,19 @@ Everything the app does is narrated in `~/Library/Logs/Slingshot.log` (also reac
 - Notarized distribution (pipeline is in scripts/package.sh, waiting on a Developer ID certificate)
 - iPad support (same Vision + MultipeerConnectivity APIs)
 
+## Slingshot Pro
+
+Slingshot is open source and the core experience is free forever: sling screenshots between two Macs with your hands, snap to wake, clap to sleep, the notch island, snap to clipboard, auto-updates. A one-time lifetime license unlocks the power features:
+
+- **File drops**: drag any file onto the notch and carry it to another Mac
+- **Bigger rooms**: three or more Macs in one mesh
+- **The face lock**: Normal mode, where only the person who grabbed can catch
+- **Clap to mute**: a clap toggles your Mac's sound instead of sleeping the camera
+
+Buy once, keep it forever, updates included. Purchase link coming with the public launch; until then, licenses are issued by hand. Enter your key from the menu bar under Get Slingshot Pro.
+
+Because the source is MIT, you can build every feature yourself from this repo. The license is for people who want the signed, auto-updating app and to keep this project alive. That trade is the whole business model, stated plainly.
+
 ## Project
 
 - [Contributing](CONTRIBUTING.md), including build and test instructions

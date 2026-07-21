@@ -48,6 +48,12 @@ Unknown keys and unknown `t` values must be ignored by receivers, so older
 peers degrade gracefully. If you add a message or field, state the
 compatibility behavior in the PR.
 
+## Pro features
+
+Some features are gated by a lifetime license at runtime. The source stays MIT
+and gates are honest checks, not obfuscation; anyone can build an ungated copy
+from this repo. PRs may touch gated features like any other code.
+
 ## Sign-off
 
 By submitting a PR you certify the

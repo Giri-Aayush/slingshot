@@ -2,6 +2,7 @@
 // toolchain does, no Xcode required: swift run SlingshotTests
 import AppKit
 import CoreGraphics
+import CryptoKit
 import Foundation
 import SlingshotCore
 import SlingshotUI
@@ -149,6 +150,37 @@ do {
     let route = routeSoundWindow(snapConfidence: 0.1, clapConfidence: 0.4,
                                  snapEnabled: true, clapEnabled: true)
     expect(route == .clap, "clapLowerBar", "clap 0.4 is over the 0.35 clap bar and should fire")
+}
+
+// MARK: - License validation
+do {
+    let priv = Curve25519.Signing.PrivateKey()
+    let pub = priv.publicKey.rawRepresentation.base64EncodedString()
+    func b64url(_ d: Data) -> String {
+        d.base64EncodedString().replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+    }
+    let payload = try! JSONSerialization.data(
+        withJSONObject: ["product": "slingshot-pro", "email": "test@example.com",
+                         "lifetime": true, "issued": "2026-07-21"],
+        options: [.sortedKeys])
+    let sig = try! priv.signature(for: payload)
+    let good = "SLINGSHOT-\(b64url(payload)).\(b64url(sig))"
+
+    expect(validateLicense(good, publicKeyBase64: pub)?.email == "test@example.com",
+           "licenseValidates", "a properly signed lifetime key should validate")
+    expect(validateLicense(good + "x", publicKeyBase64: pub) == nil,
+           "licenseTamperFails", "a tampered signature must not validate")
+    let wrongProduct = try! JSONSerialization.data(
+        withJSONObject: ["product": "other", "email": "t@e.com", "lifetime": true],
+        options: [.sortedKeys])
+    let wrongSig = try! priv.signature(for: wrongProduct)
+    expect(validateLicense("SLINGSHOT-\(b64url(wrongProduct)).\(b64url(wrongSig))", publicKeyBase64: pub) == nil,
+           "licenseWrongProductFails", "a key for another product must not validate")
+    expect(validateLicense("SLINGSHOT-garbage.alsogarbage", publicKeyBase64: pub) == nil,
+           "licenseGarbageFails", "garbage must not validate")
+    expect(validateLicense(good, publicKeyBase64: productionLicenseKey) == nil,
+           "licenseWrongKeyFails", "a key signed by another authority must not validate")
 }
 
 // MARK: - UI geometry invariants

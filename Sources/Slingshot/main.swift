@@ -6,7 +6,7 @@ import Vision
 
 // MARK: - Main
 
-log("Slingshot v2.3.1. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
+log("Slingshot v2.4. Palm then fist to sling a screenshot; snap your fingers for a clipboard copy")
 
 // A real NSApplication event loop so Finder/LaunchServices see the app check in.
 // Without this, a double-clicked launch gets flagged "not responding".
@@ -113,6 +113,7 @@ func setSnapClipboard(_ on: Bool) {
 }
 
 func setClapMute(_ on: Bool) {
+    if on && !requirePro("Clap to mute") { return }
     clapMuteEnabled = on
     UserDefaults.standard.set(on, forKey: "clapMute")
     if on {
@@ -340,6 +341,7 @@ func startEverything() {
     }
 
     NotchIsland.shared.onDropFile = { url in
+        guard requirePro("Dropping files on the notch") else { return }
         log("🪂 Dropped \(url.lastPathComponent) onto the notch. Holding it")
         DispatchQueue.global(qos: .userInitiated).async {
             link.hold(url, mode: currentMode, ownerFace: nil)
@@ -352,6 +354,8 @@ func startEverything() {
 }
 
 _ = updaterController  // start Sparkle with the app
+
+enforceFreeTier()
 
 OnboardingWindow.shared.onHandoff = { wakeCamera("welcome done") }
 OnboardingWindow.shared.showIfNeeded {

@@ -23,7 +23,7 @@ final class StatusUI: NSObject {
         item.button?.title = base + (currentMode == .normal ? " N" : " P")
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "Slingshot v2.3.1", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Slingshot v2.4", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
 
         menu.addItem(withTitle: "Mode", action: nil, keyEquivalent: "")
@@ -83,6 +83,14 @@ final class StatusUI: NSObject {
         let trustItem = NSMenuItem(title: "Reset trusted Macs", action: #selector(resetTrust), keyEquivalent: "")
         trustItem.target = self
         menu.addItem(trustItem)
+        if let license = proLicense {
+            menu.addItem(withTitle: "Slingshot Pro, licensed to \(license.email)", action: nil, keyEquivalent: "")
+        } else {
+            let proItem = NSMenuItem(title: "Get Slingshot Pro…", action: #selector(enterLicense), keyEquivalent: "")
+            proItem.target = self
+            menu.addItem(proItem)
+        }
+        menu.addItem(.separator())
         let welcomeItem = NSMenuItem(title: "Show Welcome", action: #selector(showWelcome), keyEquivalent: "")
         welcomeItem.target = self
         menu.addItem(welcomeItem)
@@ -95,6 +103,7 @@ final class StatusUI: NSObject {
     }
 
     @objc private func setNormal() {
+        guard requirePro("The face lock") else { return }
         currentMode = .normal
         log("🔒 Mode: Normal. Only the person who grabs can catch")
         refresh()
@@ -139,6 +148,10 @@ final class StatusUI: NSObject {
     @objc private func resetTrust() {
         link.resetTrust()
         refresh()
+    }
+
+    @objc private func enterLicense() {
+        promptForLicenseKey()
     }
 
     @objc private func showWelcome() {

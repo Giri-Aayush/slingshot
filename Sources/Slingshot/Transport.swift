@@ -314,6 +314,10 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
         let iid = info?["iid"] ?? "legacy:" + cleanName(id.displayName)
         lock.withLock { discovered[id] = iid }
         DispatchQueue.main.async { statusUI?.refresh() }
+        if !isPro() && !session.connectedPeers.isEmpty {
+            log("🔒 A second peer needs Slingshot Pro. Staying a two Mac room")
+            return
+        }
         switch trustStatus(of: iid) {
         case "trusted":
             if shouldInvite(id) { invite(id) }
@@ -350,6 +354,11 @@ final class PeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertiserDele
             iid = sent
         } else {
             iid = "legacy:" + cleanName(id.displayName)
+        }
+        if !isPro() && !session.connectedPeers.isEmpty {
+            log("🔒 A second peer needs Slingshot Pro. Declining \(id.displayName)")
+            invitationHandler(false, nil)
+            return
         }
         switch trustStatus(of: iid) {
         case "trusted":
